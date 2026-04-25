@@ -60,6 +60,12 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
     case "fetch2b":
       return fetch2bForPeriod(message.gstin, message.period);
 
+    case "dispatch":
+      return dispatchAction(message);
+
+    case "keepalive":
+      return keepalive(message.gstin);
+
     case "logout":
       return logout(message.gstin);
   }
@@ -265,6 +271,225 @@ function waitForTabLoad(tabId: number, timeoutMs: number): Promise<void> {
       }
     }, 500);
   });
+}
+
+// ── Action-code dispatcher ──────────────────────────────────
+//
+// Mirrors fillgst-helper-node's /portal/dispatch route — same shape so
+// the FillGST web app can target either path with identical payloads.
+// Reference: docs/compugst-knowledge.md §1 in the FillGST web-app repo.
+
+const REAUTH_FORCELOGIN = new Set(["AUTH4033", "AUTH4041"]);
+const REAUTH_FORCEOTP = new Set(["AUTH101", "AUTH151", "AUTH153", "AUTH154"]);
+const RETRYABLE_CODES = new Set(["TEC4002", "SWEB_9003"]);
+
+function remapQuarter(period: string): string {
+  const map: Record<string, string> = { "21": "06", "22": "09", "23": "12", "24": "03" };
+  if (period.length === 6) {
+    const mm = period.slice(0, 2);
+    if (map[mm]) return map[mm] + period.slice(2);
+  }
+  return period;
+}
+
+function urlForDispatch(msg: Extract<ToExtension, { type: "dispatch" }>): {
+  url: string;
+  referer: string;
+} {
+  if (msg.urlOverride) {
+    return {
+      url: msg.urlOverride,
+      referer: "https://return.gst.gov.in/returns/auth/dashboard",
+    };
+  }
+  const period = msg.period ? remapQuarter(msg.period) : undefined;
+  const params = new URLSearchParams(msg.params ?? {});
+
+  if (msg.formNo === "2b" && msg.action === "B2B") {
+    if (period) params.set("rtnprd", period);
+    const qs = params.toString();
+    return {
+      url: `https://gstr2b.gst.gov.in/gstr2b/auth/gstr2bdwld${qs ? "?" + qs : ""}`,
+      referer: "https://return.gst.gov.in/returns/auth/dashboard",
+    };
+  }
+
+  if (msg.formNo === "ims") {
+    if (period) params.set("rtnprd", period);
+    const action = msg.action === "IMS_FETCH" ? "fetchIMS" : "actionIMS";
+    const qs = params.toString();
+    return {
+      url: `https://return.gst.gov.in/returns2/auth/api/${action}${qs ? "?" + qs : ""}`,
+      referer: "https://return.gst.gov.in/returns/auth/dashboard",
+    };
+  }
+
+  if (period) params.set("ret_period", period);
+  params.set("action", msg.action);
+  params.set("formno", msg.formNo);
+  const qs = params.toString();
+  return {
+    url: `https://return.gst.gov.in/returns/auth/api/dispatcher${qs ? "?" + qs : ""}`,
+    referer: "https://return.gst.gov.in/returns/auth/dashboard",
+  };
+}
+
+async function dispatchAction(
+  msg: Extract<ToExtension, { type: "dispatch" }>,
+): Promise<FromExtension> {
+  // Need an authenticated tab so the same-origin fetch carries cookies.
+  const tabs = await chrome.tabs.query({ url: "https://*.gst.gov.in/*" });
+  let tabId = tabs[0]?.id;
+  if (!tabId) {
+    const tab = await chrome.tabs.create({
+      url: "https://return.gst.gov.in/returns/auth/dashboard",
+      active: false,
+    });
+    if (!tab.id) {
+      return { ok: false, error: "Could not open a portal tab to dispatch through" };
+    }
+    tabId = tab.id;
+    await waitForTabLoad(tabId, 20000);
+  }
+
+  const { url, referer } = urlForDispatch(msg);
+
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: dispatchInPage,
+      args: [url, referer, msg.method, msg.body ?? null],
+    });
+    const out = result[0]?.result;
+    if (!out || typeof out !== "object") {
+      return { ok: false, error: "Dispatcher returned no data" };
+    }
+    const r = out as {
+      status: number;
+      json: unknown;
+      networkError?: string;
+    };
+    if (r.networkError) {
+      return { ok: false, error: r.networkError, retryable: true };
+    }
+    return interpretResponse(r.status, r.json, url);
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function dispatchInPage(
+  url: string,
+  referer: string,
+  method: string,
+  body: unknown,
+): Promise<{ status: number; json: unknown; networkError?: string }> {
+  return (async () => {
+    try {
+      const init: RequestInit = {
+        method,
+        credentials: "include",
+        headers: {
+          Accept: "application/json",
+          Referer: referer,
+          ...(body !== null ? { "Content-Type": "application/json" } : {}),
+        },
+      };
+      if (body !== null) init.body = JSON.stringify(body);
+      const resp = await fetch(url, init);
+      let json: unknown;
+      try {
+        json = await resp.json();
+      } catch {
+        json = await resp.text().catch(() => null);
+      }
+      return { status: resp.status, json };
+    } catch (err) {
+      return {
+        status: 0,
+        json: null,
+        networkError: err instanceof Error ? err.message : String(err),
+      };
+    }
+  })();
+}
+
+function interpretResponse(status: number, json: unknown, endpoint: string): FromExtension {
+  if (status >= 500) {
+    return { ok: false, error: `GSTN ${status} on ${endpoint}`, retryable: true };
+  }
+  const j = json as {
+    status?: number | string;
+    error?: { errorCode?: string; message?: string };
+    data?: unknown;
+    ref_id?: string;
+  } | null;
+  const code = j?.error?.errorCode;
+  const reauth = code
+    ? REAUTH_FORCELOGIN.has(code)
+      ? "FORCELOGIN"
+      : REAUTH_FORCEOTP.has(code)
+      ? "FORCEOTP"
+      : undefined
+    : undefined;
+
+  if (status >= 400 || (j && j.status !== undefined && j.status !== 1 && j.status !== "1" && !j.data)) {
+    return {
+      ok: false,
+      errorCode: code,
+      error: j?.error?.message ?? `HTTP ${status}`,
+      retryable: code ? RETRYABLE_CODES.has(code) : false,
+      reauthNeeded: reauth,
+    };
+  }
+  return {
+    ok: true,
+    type: "dispatchResult",
+    status: typeof j?.status === "string" ? j.status : undefined,
+    refId: j?.ref_id,
+    data: j?.data ?? j ?? undefined,
+    raw: json,
+    endpoint,
+  };
+}
+
+// ── Keepalive ───────────────────────────────────────────────
+
+const KEEPALIVE_PATHS = [
+  "https://return.gst.gov.in/returns/auth/api/keepalive",
+  "https://services.gst.gov.in/services/auth/api/keepalive",
+];
+
+async function keepalive(_gstin: string): Promise<FromExtension> {
+  const tabs = await chrome.tabs.query({ url: "https://*.gst.gov.in/*" });
+  const tabId = tabs[0]?.id;
+  if (!tabId) {
+    return { ok: false, error: "no portal tab open; nothing to keep alive" };
+  }
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: keepaliveInPage,
+      args: [KEEPALIVE_PATHS],
+    });
+    const statuses = (result[0]?.result as number[] | undefined) ?? [];
+    return { ok: true, type: "keepaliveResult", statuses };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function keepaliveInPage(paths: string[]): Promise<number[]> {
+  return Promise.all(
+    paths.map(async (url) => {
+      try {
+        const r = await fetch(url, { credentials: "include" });
+        return r.status;
+      } catch {
+        return 0;
+      }
+    }),
+  );
 }
 
 // ── Lifecycle ───────────────────────────────────────────────
