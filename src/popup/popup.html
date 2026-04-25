@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>FillGST Helper</title>
+    <style>
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        margin: 0;
+        padding: 16px;
+        width: 280px;
+        background: #1a1a1a;
+        color: #e8e8e8;
+        font-size: 13px;
+      }
+      h1 {
+        font-size: 14px;
+        margin: 0 0 12px;
+        color: #fff;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .badge {
+        display: inline-block;
+        background: #d75a2c;
+        color: white;
+        padding: 1px 6px;
+        border-radius: 8px;
+        font-size: 10px;
+        font-weight: 600;
+      }
+      a {
+        color: #f9a577;
+      }
+      .logo {
+        display: inline-flex;
+        width: 18px;
+        height: 18px;
+        background: #d75a2c;
+        color: white;
+        font-weight: 700;
+        font-size: 9px;
+        align-items: center;
+        justify-content: center;
+        border-radius: 4px;
+      }
+      .status {
+        padding: 8px 10px;
+        border-radius: 6px;
+        background: #262626;
+        margin-bottom: 10px;
+        font-size: 12px;
+      }
+      .status.ok {
+        background: rgba(34, 197, 94, 0.12);
+        color: #4ade80;
+        border: 1px solid rgba(34, 197, 94, 0.3);
+      }
+      .status.warn {
+        background: rgba(234, 179, 8, 0.12);
+        color: #facc15;
+        border: 1px solid rgba(234, 179, 8, 0.3);
+      }
+      .info {
+        font-size: 11px;
+        color: #888;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>
+      <span class="logo">FG</span>
+      FillGST Helper <span class="badge" id="version">v0.2.0</span>
+    </h1>
+    <div class="status" id="status">Checking…</div>
+    <div class="info">
+      This extension lets <strong>FillGST</strong> talk to the GST portal
+      from your Chrome — so you don&apos;t need OTP every time after the
+      first login.
+    </div>
+    <script type="module" src="popup.ts"></script>
+  </body>
+</html>

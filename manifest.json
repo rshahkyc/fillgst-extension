@@ -1,0 +1,68 @@
+{
+  "manifest_version": 3,
+  "name": "FillGST Helper",
+  "version": "0.2.0",
+  "description": "Connects FillGST web app to the GST portal in your local Chrome — no OTP after first login, no automation fingerprint.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwNoxV1IlVAgu0djtoQri+tjB/2sqKJnFFBA88bStwO/R7Mg8lKYEAXrBnFk7WA8pOB2YGGIRUJqjQ6O5aec8fvulJxyQNxyvUXd3Qww7DBCwTtUKjTyf9bwdoutooBWod2mG4cjmP5eXIxAvurxbwypklsz4wVeBcvgTW2wLwugmDiDxscxGo5i/xX6jdmnKAkqNzl/Sd516wAb0XXG12+8G/FMj3l+DKEZ8wy7+KFT/5Q3WJ1E+yvjSHJ9Cag27Ay6j0JzPCMgAWGF1l6/q1vjPD94g0QycvQL1UHQaZdZ9VlFWHmmi/t/qTmgW5LA46sWfCjdr7TmtfCa0xNiGJQIDAQAB",
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "FillGST Helper"
+  },
+  "options_ui": {
+    "page": "src/options/options.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "src/background.ts",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://services.gst.gov.in/*",
+        "https://return.gst.gov.in/*",
+        "https://gstr2b.gst.gov.in/*",
+        "https://returns.gst.gov.in/*",
+        "https://einvoice.gst.gov.in/*"
+      ],
+      "js": ["src/content/portal-helper.ts"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://localhost:*/*",
+        "http://127.0.0.1:*/*",
+        "http://192.168.0.*:*/*",
+        "http://192.168.1.*:*/*",
+        "http://192.168.2.*:*/*",
+        "http://10.0.0.*:*/*",
+        "http://10.0.1.*:*/*"
+      ],
+      "js": ["src/content/fillgst-marker.ts"],
+      "run_at": "document_start"
+    }
+  ],
+  "permissions": ["cookies", "storage", "scripting", "tabs"],
+  "host_permissions": [
+    "https://*.gst.gov.in/*"
+  ],
+  "externally_connectable": {
+    "matches": [
+      "https://fillgst.com/*",
+      "https://*.fillgst.com/*",
+      "https://fillgst.in/*",
+      "https://*.fillgst.in/*",
+      "https://fillgst.ai/*",
+      "https://*.fillgst.ai/*",
+      "https://fillgst.vercel.app/*",
+      "https://*.vercel.app/*",
+      "http://localhost:*/*",
+      "http://127.0.0.1:*/*",
+      "http://192.168.0.*:*/*",
+      "http://192.168.1.*:*/*",
+      "http://192.168.2.*:*/*",
+      "http://10.0.0.*:*/*",
+      "http://10.0.1.*:*/*"
+    ]
+  }
+}

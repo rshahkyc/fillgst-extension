@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.crx
+*.zip
+
+# Signing keys — NEVER commit
+.keys/extension.pem
+.keys/*.pem
+.keys/*.key
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Env / local
+.env
+.env.local
+.env.*.local
