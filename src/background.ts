@@ -186,29 +186,44 @@ async function fetch2bForPeriod(gstin: string, period: string): Promise<FromExte
 }
 
 // Function injected into the page — runs in the tab's JS context
-// so cookies + same-origin policy apply naturally
-function fetchGstr2bInPage(period: string): Promise<{ ok: boolean; data?: unknown; size?: number; error?: string }> {
+// so cookies + same-origin policy apply naturally.
+//
+// GSTR-2B endpoints:
+//   v4.0 (Oct 2024+):  GET /gstr2b/auth/gstr2bdwld?rtnprd={period}
+//   legacy:            GET /gstr2b/auth/api/gstr2b/getjson?rtnprd={period}
+// Try v4.0 first; on 404/410 fall back to legacy. Both return the same
+// envelope shape; the FillGST web-app parser handles either flat (v4.0)
+// or rate-wise (legacy) tax fields. IMS hidden flags
+// (IsPendingBlocked, IsITCBlocked, IsRemarkBlocked, ItcAvailabilityCheck)
+// arrive as-is and are forwarded to the server.
+function fetchGstr2bInPage(period: string): Promise<{ ok: boolean; data?: unknown; size?: number; endpoint?: string; error?: string }> {
   return (async () => {
-    try {
-      const url = `https://gstr2b.gst.gov.in/gstr2b/auth/api/gstr2b/getjson?rtnprd=${period}`;
-      const resp = await fetch(url, {
-        credentials: "include",
-        headers: {
-          "Accept": "application/json",
-        },
-      });
-      if (!resp.ok) {
-        return { ok: false, error: `HTTP ${resp.status}` };
+    const endpoints = [
+      `https://gstr2b.gst.gov.in/gstr2b/auth/gstr2bdwld?rtnprd=${period}`,
+      `https://gstr2b.gst.gov.in/gstr2b/auth/api/gstr2b/getjson?rtnprd=${period}`,
+    ];
+    let lastError = "no endpoints tried";
+    for (const url of endpoints) {
+      try {
+        const resp = await fetch(url, {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        });
+        if (resp.status === 404 || resp.status === 410) {
+          lastError = `HTTP ${resp.status} from ${url}`;
+          continue;
+        }
+        if (!resp.ok) {
+          return { ok: false, error: `HTTP ${resp.status} from ${url}` };
+        }
+        const data = await resp.json();
+        const text = JSON.stringify(data);
+        return { ok: true, data, size: text.length, endpoint: url };
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
       }
-      const data = await resp.json();
-      const text = JSON.stringify(data);
-      return { ok: true, data, size: text.length };
-    } catch (err) {
-      return {
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      };
     }
+    return { ok: false, error: lastError };
   })();
 }
 
