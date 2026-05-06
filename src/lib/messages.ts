@@ -79,7 +79,7 @@ export type FromExtension =
     };
 
 export const EXTENSION_NAME = "FillGST Helper";
-export const EXTENSION_VERSION = "0.3.0";
+export const EXTENSION_VERSION = "0.4.0";
 
 /**
  * Stable Chrome extension ID, deterministically derived from the public
