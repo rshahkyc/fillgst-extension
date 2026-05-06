@@ -18,10 +18,11 @@ async function init() {
   if (!statusEl) return;
   if (sessionCookie) {
     statusEl.className = "status ok";
-    statusEl.textContent = `Connected to GST Portal (${cookies.length} cookies)`;
+    statusEl.textContent = `Ready · GST portal session live (${cookies.length} cookies). Pick "Browser session (no OTP)" in FillGST to fetch for free.`;
   } else {
     statusEl.className = "status warn";
-    statusEl.textContent = "Not signed into GST Portal yet — open FillGST and click Login.";
+    statusEl.textContent =
+      "Not signed into GST Portal yet — log into services.gst.gov.in in another tab, then click Fetch in FillGST.";
   }
 }
 
