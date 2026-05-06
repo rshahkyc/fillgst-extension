@@ -38,6 +38,7 @@ export type Method = "GET" | "POST" | "PUT";
 export type ToExtension =
   | { type: "ping" }
   | { type: "checkUpdate" }
+  | { type: "openExtensionsPage" }
   | { type: "loginCheck"; gstin: string }
   | { type: "openLogin"; gstin: string }
   | { type: "fetch2b"; gstin: string; period: string }
@@ -73,6 +74,7 @@ export type FromExtension =
       result: "no_update" | "update_available" | "throttled";
       currentVersion: string;
     }
+  | { ok: true; type: "extensionsPageOpened"; tabId: number }
   | { ok: true; type: "loginStatus"; loggedIn: boolean; cookieCount: number }
   | { ok: true; type: "loginOpened"; tabId: number; message: string }
   | { ok: true; type: "fetch2bResult"; data: unknown; size: number }
@@ -96,7 +98,7 @@ export type FromExtension =
     };
 
 export const EXTENSION_NAME = "FillGST Helper";
-export const EXTENSION_VERSION = "0.5.0";
+export const EXTENSION_VERSION = "0.6.0";
 
 /**
  * Stable Chrome extension ID, deterministically derived from the public

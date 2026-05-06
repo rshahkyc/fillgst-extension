@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FillGST Helper",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Connects FillGST web app to the GST portal in your local Chrome — no OTP after first login, no automation fingerprint.",
   "update_url": "https://fillgst.com/api/extension/updates.xml",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwNoxV1IlVAgu0djtoQri+tjB/2sqKJnFFBA88bStwO/R7Mg8lKYEAXrBnFk7WA8pOB2YGGIRUJqjQ6O5aec8fvulJxyQNxyvUXd3Qww7DBCwTtUKjTyf9bwdoutooBWod2mG4cjmP5eXIxAvurxbwypklsz4wVeBcvgTW2wLwugmDiDxscxGo5i/xX6jdmnKAkqNzl/Sd516wAb0XXG12+8G/FMj3l+DKEZ8wy7+KFT/5Q3WJ1E+yvjSHJ9Cag27Ay6j0JzPCMgAWGF1l6/q1vjPD94g0QycvQL1UHQaZdZ9VlFWHmmi/t/qTmgW5LA46sWfCjdr7TmtfCa0xNiGJQIDAQAB",

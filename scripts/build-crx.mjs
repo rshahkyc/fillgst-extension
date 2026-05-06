@@ -98,18 +98,26 @@ async function main() {
   console.log(`  Meta: dist/crx-meta.json`);
 
   // Copy into FillGST's public folder for serving via /api/extension/updates.xml.
-  // Tries common relative paths against this user's machine layout —
   // OneDrive\Documents\GitHub\fillgst\public\extension is the canonical
-  // location per the project plan. Falls back to a hint if the repo
-  // isn't where we expect.
+  // location per the project plan; the env override and the absolute home
+  // path take precedence over relative-walk candidates because Windows
+  // is case-insensitive and the relative walks would otherwise match
+  // unrelated FILLGST / FILLGSTV1 v0-prototype folders next to this one.
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? "";
   const candidates = [
-    // From OneDrive\Desktop\claude code\fillgst-extension → Documents\GitHub\fillgst
+    // Explicit override.
+    process.env.FILLGST_REPO_PATH
+      ? resolve(process.env.FILLGST_REPO_PATH, "public", "extension")
+      : null,
+    // Canonical user-home path on the dev machine.
+    home ? resolve(home, "OneDrive", "Documents", "GitHub", "fillgst", "public", "extension") : null,
+    // From OneDrive\Desktop\claude code\fillgst-extension → ~\Documents\GitHub\fillgst (no OneDrive)
     resolve(root, "..", "..", "..", "..", "Documents", "GitHub", "fillgst", "public", "extension"),
     // Sibling layout (rare): claude code/fillgst-extension → claude code/fillgst
     resolve(root, "..", "fillgst", "public", "extension"),
     // Same-parent layout: <parent>/fillgst
     resolve(root, "..", "..", "fillgst", "public", "extension"),
-  ];
+  ].filter((p) => typeof p === "string");
 
   let copied = false;
   for (const fillgstPublic of candidates) {

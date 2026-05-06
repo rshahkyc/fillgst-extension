@@ -54,6 +54,9 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
     case "checkUpdate":
       return triggerUpdateCheck();
 
+    case "openExtensionsPage":
+      return openExtensionsPage();
+
     case "loginCheck":
       return checkLoginStatus(message.gstin);
 
@@ -114,6 +117,29 @@ async function triggerUpdateCheck(): Promise<FromExtension> {
       ok: false,
       error: err instanceof Error ? err.message : String(err),
       errorCode: "UPDATE_CHECK_FAILED",
+    };
+  }
+}
+
+// ── Open chrome://extensions ────────────────────────────────
+
+/**
+ * Open chrome://extensions in a new tab, focused on this extension's
+ * card so the operator can immediately see the version + reload /
+ * details buttons. Web pages can't navigate to chrome:// URLs; only
+ * extensions can — `chrome.tabs.create({ url: "chrome://..." })`
+ * works because the extension's tab API has privileged URL access.
+ */
+async function openExtensionsPage(): Promise<FromExtension> {
+  const url = `chrome://extensions/?id=${chrome.runtime.id}`;
+  try {
+    const tab = await chrome.tabs.create({ url, active: true });
+    return { ok: true, type: "extensionsPageOpened", tabId: tab.id ?? -1 };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorCode: "OPEN_TAB_FAILED",
     };
   }
 }
