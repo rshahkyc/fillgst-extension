@@ -119,21 +119,31 @@ async function main() {
     resolve(root, "..", "..", "fillgst", "public", "extension"),
   ].filter((p) => typeof p === "string");
 
+  // Three artifacts are served from FillGST's /extension/ folder:
+  //   - fillgst-helper.crx        → consumed by Chrome's auto-update channel (update_url)
+  //   - fillgst-helper.zip        → user-initiated download from /install/extension
+  //                                  (Chrome silently deletes user-clicked .crx files
+  //                                  from non-Web-Store origins, so we serve the zip)
+  //   - crx-meta.json             → version + sha256 for the updates.xml endpoint
+  const zipPath = join(outDir, "fillgst-helper.zip");
   let copied = false;
   for (const fillgstPublic of candidates) {
     const fillgstRoot = resolve(fillgstPublic, "..", "..");
     if (existsSync(join(fillgstRoot, "package.json"))) {
       await mkdir(fillgstPublic, { recursive: true });
       await copyFile(crxPath, join(fillgstPublic, "fillgst-helper.crx"));
+      if (existsSync(zipPath)) {
+        await copyFile(zipPath, join(fillgstPublic, "fillgst-helper.zip"));
+      }
       await copyFile(join(outDir, "crx-meta.json"), join(fillgstPublic, "crx-meta.json"));
-      console.log(`✓ Copied to ${fillgstPublic}/`);
+      console.log(`✓ Copied .crx + .zip + crx-meta.json to ${fillgstPublic}/`);
       copied = true;
       break;
     }
   }
   if (!copied) {
     console.log(
-      "ℹ FillGST repo not found at any expected location — copy dist/fillgst-helper.crx + crx-meta.json into <fillgst-repo>/public/extension/ manually.",
+      "ℹ FillGST repo not found at any expected location — copy dist/fillgst-helper.crx + dist/fillgst-helper.zip + crx-meta.json into <fillgst-repo>/public/extension/ manually.",
     );
   }
 }
