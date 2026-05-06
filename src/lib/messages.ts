@@ -37,6 +37,7 @@ export type Method = "GET" | "POST" | "PUT";
 
 export type ToExtension =
   | { type: "ping" }
+  | { type: "checkUpdate" }
   | { type: "loginCheck"; gstin: string }
   | { type: "openLogin"; gstin: string }
   | { type: "fetch2b"; gstin: string; period: string }
@@ -56,6 +57,22 @@ export type ToExtension =
 
 export type FromExtension =
   | { ok: true; type: "pong"; version: string }
+  | {
+      ok: true;
+      type: "updateCheck";
+      /**
+       * Chrome's response from `chrome.runtime.requestUpdateCheck`:
+       *   - "no_update"  : already on the newest version
+       *   - "update_available" : a newer version was found and queued
+       *   - "throttled"  : Chrome rate-limited us; try again in a few seconds
+       *
+       * When the result is "update_available", the new version installs
+       * automatically the next time the service worker idles. The web app
+       * pings again after a short delay to confirm the bump.
+       */
+      result: "no_update" | "update_available" | "throttled";
+      currentVersion: string;
+    }
   | { ok: true; type: "loginStatus"; loggedIn: boolean; cookieCount: number }
   | { ok: true; type: "loginOpened"; tabId: number; message: string }
   | { ok: true; type: "fetch2bResult"; data: unknown; size: number }
@@ -79,7 +96,7 @@ export type FromExtension =
     };
 
 export const EXTENSION_NAME = "FillGST Helper";
-export const EXTENSION_VERSION = "0.4.0";
+export const EXTENSION_VERSION = "0.5.0";
 
 /**
  * Stable Chrome extension ID, deterministically derived from the public

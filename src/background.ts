@@ -51,6 +51,9 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
     case "ping":
       return { ok: true, type: "pong", version: EXTENSION_VERSION };
 
+    case "checkUpdate":
+      return triggerUpdateCheck();
+
     case "loginCheck":
       return checkLoginStatus(message.gstin);
 
@@ -68,6 +71,50 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
 
     case "logout":
       return logout(message.gstin);
+  }
+}
+
+// ── Auto-update trigger ─────────────────────────────────────
+
+/**
+ * Force Chrome to check the manifest's `update_url` for a newer
+ * version. Without this call, Chrome only polls every ~5 hours.
+ *
+ * Returns one of three states from `chrome.runtime.requestUpdateCheck`:
+ *   - "no_update"        already running the newest version
+ *   - "update_available" newer version downloaded, will install on idle
+ *   - "throttled"        called too often; back off + retry
+ */
+async function triggerUpdateCheck(): Promise<FromExtension> {
+  if (!chrome.runtime.requestUpdateCheck) {
+    return {
+      ok: false,
+      error:
+        "chrome.runtime.requestUpdateCheck is unavailable. Manifest must declare update_url + the install must be a Chrome-managed extension (not a side-loaded unpacked dir).",
+      errorCode: "UPDATE_API_UNAVAILABLE",
+    };
+  }
+  try {
+    const result = await new Promise<chrome.runtime.RequestUpdateCheckStatus>((resolve, reject) => {
+      // The Chrome API is callback-style in MV3 service workers.
+      chrome.runtime.requestUpdateCheck((status) => {
+        const lastError = chrome.runtime.lastError?.message;
+        if (lastError) reject(new Error(lastError));
+        else resolve(status);
+      });
+    });
+    return {
+      ok: true,
+      type: "updateCheck",
+      result,
+      currentVersion: EXTENSION_VERSION,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorCode: "UPDATE_CHECK_FAILED",
+    };
   }
 }
 
