@@ -565,6 +565,91 @@ function keepaliveInPage(paths: string[]): Promise<number[]> {
   );
 }
 
+// ── Tally Bridge (intra-extension messaging) ────────────────
+//
+// Migrated from the standalone fillgst-tally-bridge extension (v1.0.0,
+// May 2026) so a single Chrome install handles both GSTN automation and
+// TallyPrime HTTP relay. The page side surface is unchanged:
+//
+//   window.__fillgstTallyBridge.tallyFetch(xml, opts)   → POST localhost:9000
+//   window.__fillgstTallyBridge.ping()                  → version probe
+//
+// Implemented via a main-world inject (`tally-inject.ts`) + isolated-world
+// relay (`tally-relay.ts`) that postMessage-bridges into this listener.
+// Allowed only on localhost / 127.0.0.1 :9000 (Tally) and :9876 (helper-node).
+
+const TALLY_ALLOWED_HOSTS = new Set(["localhost", "127.0.0.1"]);
+const TALLY_ALLOWED_PORTS = new Set([9000, 9876]);
+
+interface TallyFetchMessage {
+  type: "tally-fetch";
+  xml?: string;
+  host?: string;
+  port?: number;
+  timeoutMs?: number;
+}
+
+interface TallyPingMessage {
+  type: "tally-ping";
+}
+
+type TallyMessage = TallyFetchMessage | TallyPingMessage;
+
+function isTallyMessage(m: unknown): m is TallyMessage {
+  if (!m || typeof m !== "object") return false;
+  const t = (m as { type?: unknown }).type;
+  return t === "tally-fetch" || t === "tally-ping";
+}
+
+chrome.runtime.onMessage.addListener((rawMsg: unknown, _sender, sendResponse) => {
+  if (!isTallyMessage(rawMsg)) return false;
+
+  if (rawMsg.type === "tally-ping") {
+    sendResponse({ ok: true, version: EXTENSION_VERSION });
+    return false;
+  }
+
+  // tally-fetch
+  const host = String(rawMsg.host ?? "localhost");
+  const port = Number(rawMsg.port ?? 9000);
+  if (!TALLY_ALLOWED_HOSTS.has(host) || !TALLY_ALLOWED_PORTS.has(port)) {
+    sendResponse({
+      ok: false,
+      status: 0,
+      error: `Host:port not allowed by extension (${host}:${port}). Only localhost/127.0.0.1 on :9000 (Tally) or :9876 (helper-node).`,
+    });
+    return false;
+  }
+
+  const timeoutMs = Number(rawMsg.timeoutMs ?? 60_000);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  const url = `http://${host}:${port}`;
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "text/xml; charset=utf-8" },
+    body: String(rawMsg.xml ?? ""),
+    signal: ctrl.signal,
+  })
+    .then(async (r) => {
+      clearTimeout(timer);
+      const text = await r.text();
+      sendResponse({ ok: r.ok, status: r.status, body: text });
+    })
+    .catch((err: unknown) => {
+      clearTimeout(timer);
+      const e = err as { name?: string; message?: string } | undefined;
+      const message =
+        e?.name === "AbortError"
+          ? `Tally didn't respond within ${Math.round(timeoutMs / 1000)}s. Is TallyPrime running with HTTP server on port ${port}?`
+          : (e?.message ?? "Tally fetch failed");
+      sendResponse({ ok: false, status: 0, error: message });
+    });
+
+  // Tell Chrome we'll call sendResponse asynchronously.
+  return true;
+});
+
 // ── Lifecycle ───────────────────────────────────────────────
 
 chrome.runtime.onInstalled.addListener(() => {

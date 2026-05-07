@@ -1,6 +1,6 @@
 {
   "name": "fillgst-extension",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "private": true,
   "description": "FillGST Helper — Chrome extension for GST portal automation per user PC",
   "type": "module",

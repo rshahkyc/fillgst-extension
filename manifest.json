@@ -1,8 +1,9 @@
 {
   "manifest_version": 3,
   "name": "FillGST Helper",
-  "version": "0.6.1",
-  "description": "Connects FillGST web app to the GST portal in your local Chrome — no OTP after first login, no automation fingerprint.",
+  "version": "0.7.0",
+  "description": "Connects FillGST to the GST portal + your local TallyPrime — no OTP after first login, no automation fingerprint, books data never leaves your PC.",
+  "minimum_chrome_version": "111",
   "update_url": "https://fillgst.com/api/extension/updates.xml",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwNoxV1IlVAgu0djtoQri+tjB/2sqKJnFFBA88bStwO/R7Mg8lKYEAXrBnFk7WA8pOB2YGGIRUJqjQ6O5aec8fvulJxyQNxyvUXd3Qww7DBCwTtUKjTyf9bwdoutooBWod2mG4cjmP5eXIxAvurxbwypklsz4wVeBcvgTW2wLwugmDiDxscxGo5i/xX6jdmnKAkqNzl/Sd516wAb0XXG12+8G/FMj3l+DKEZ8wy7+KFT/5Q3WJ1E+yvjSHJ9Cag27Ay6j0JzPCMgAWGF1l6/q1vjPD94g0QycvQL1UHQaZdZ9VlFWHmmi/t/qTmgW5LA46sWfCjdr7TmtfCa0xNiGJQIDAQAB",
   "action": {
@@ -47,11 +48,54 @@
       ],
       "js": ["src/content/fillgst-marker.ts"],
       "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://fillgst.com/*",
+        "https://*.fillgst.com/*",
+        "https://fillgst.in/*",
+        "https://*.fillgst.in/*",
+        "https://fillgst.ai/*",
+        "https://*.fillgst.ai/*",
+        "https://fillgst.vercel.app/*",
+        "https://*.vercel.app/*",
+        "https://*.run.app/*",
+        "http://localhost/*",
+        "http://localhost:*/*",
+        "http://127.0.0.1/*",
+        "http://127.0.0.1:*/*"
+      ],
+      "js": ["src/content/tally-inject.ts"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://fillgst.com/*",
+        "https://*.fillgst.com/*",
+        "https://fillgst.in/*",
+        "https://*.fillgst.in/*",
+        "https://fillgst.ai/*",
+        "https://*.fillgst.ai/*",
+        "https://fillgst.vercel.app/*",
+        "https://*.vercel.app/*",
+        "https://*.run.app/*",
+        "http://localhost/*",
+        "http://localhost:*/*",
+        "http://127.0.0.1/*",
+        "http://127.0.0.1:*/*"
+      ],
+      "js": ["src/content/tally-relay.ts"],
+      "run_at": "document_start"
     }
   ],
   "permissions": ["cookies", "storage", "scripting", "tabs"],
   "host_permissions": [
-    "https://*.gst.gov.in/*"
+    "https://*.gst.gov.in/*",
+    "http://localhost:9000/*",
+    "http://127.0.0.1:9000/*",
+    "http://localhost:9876/*",
+    "http://127.0.0.1:9876/*"
   ],
   "externally_connectable": {
     "matches": [
