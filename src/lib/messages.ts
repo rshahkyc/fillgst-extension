@@ -20,6 +20,7 @@ export type ActionCode =
   | "RETSAVE" | "RETSUBMIT" | "RETFILE" | "RETNEWPTF" | "RETFILER1A"
   | "RETSUM" | "RETSTATUS" | "RETACCEPT" | "RETOFFSET" | "GENERATE"
   | "CASH" | "RECORDS" | "FORCEOTP" | "FORCELOGIN"
+  | "GET_GSTR2B"
   | "B2B" | "B2BA" | "B2CL" | "B2CLA" | "B2CS" | "B2CSA"
   | "CDNR" | "CDNRA" | "CDNUR" | "CDNURA"
   | "EXP" | "EXPA" | "NIL" | "HSN" | "HSNSUM"
@@ -53,6 +54,24 @@ export type ToExtension =
       params?: Record<string, string>;
       urlOverride?: string;
     }
+  // Auto-login + fetch-2B in one flow. Mirrors the Playwright-driven
+  // helper-node /portal/login + /portal/captcha + /portal/otp + /portal/fetch2b
+  // sequence — but inside the user's Chrome via chrome.tabs +
+  // chrome.scripting.executeScript. The web app captures the captcha
+  // image returned by `needsCaptcha` and shows it in the FillGST UI;
+  // user types into FillGST; web app sends back via `submitLoginCaptcha`.
+  // Same flow for OTP. On success, returns `fetch2bResult` directly.
+  | {
+      type: "loginAndFetch2b";
+      sessionId: string;
+      gstin: string;
+      period: string;
+      username?: string;
+      password?: string;
+    }
+  | { type: "submitLoginCaptcha"; sessionId: string; captcha: string }
+  | { type: "submitLoginOtp"; sessionId: string; otp: string }
+  | { type: "cancelLoginFlow"; sessionId: string }
   | { type: "keepalive"; gstin: string }
   | { type: "logout"; gstin: string };
 
@@ -78,6 +97,16 @@ export type FromExtension =
   | { ok: true; type: "loginStatus"; loggedIn: boolean; cookieCount: number }
   | { ok: true; type: "loginOpened"; tabId: number; message: string }
   | { ok: true; type: "fetch2bResult"; data: unknown; size: number }
+  // Auto-login mid-flow states. The web app shows the captcha image in
+  // the FillGST modal, captures the user's typed text, and sends it
+  // back via `submitLoginCaptcha`. Same for OTP. `needsCredentials`
+  // is sent when the web app called `loginAndFetch2b` without
+  // username/password; the web app should fetch decrypted creds from
+  // its own /api/portal/helper/credentials endpoint and re-send.
+  | { ok: true; type: "needsCredentials"; sessionId: string }
+  | { ok: true; type: "needsCaptcha"; sessionId: string; captchaImage: string }
+  | { ok: true; type: "needsOtp"; sessionId: string }
+  | { ok: true; type: "loginCancelled"; sessionId: string }
   | {
       ok: true;
       type: "dispatchResult";
@@ -98,7 +127,7 @@ export type FromExtension =
     };
 
 export const EXTENSION_NAME = "FillGST Helper";
-export const EXTENSION_VERSION = "0.7.0";
+export const EXTENSION_VERSION = "0.7.5";
 
 /**
  * Stable Chrome extension ID, deterministically derived from the public

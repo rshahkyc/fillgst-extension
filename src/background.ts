@@ -69,11 +69,692 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
     case "dispatch":
       return dispatchAction(message);
 
+    case "loginAndFetch2b":
+      return loginAndFetch2b(message);
+
+    case "submitLoginCaptcha":
+      return submitLoginCaptcha(message);
+
+    case "submitLoginOtp":
+      return submitLoginOtp(message);
+
+    case "cancelLoginFlow":
+      return cancelLoginFlow(message);
+
     case "keepalive":
       return keepalive(message.gstin);
 
     case "logout":
       return logout(message.gstin);
+  }
+}
+
+// ── Auto-login + fetch-2B orchestrator (Playwright-style, in Chrome) ──
+//
+// Mirrors fillgst-helper-node's startSession → /portal/captcha → /portal/otp
+// → fetch2b sequence. The flow:
+//   1. loginAndFetch2b: open visible login tab, fill creds, capture
+//      captcha image as base64, return it to FillGST as `needsCaptcha`.
+//   2. submitLoginCaptcha: fill captcha + submit, watch for dashboard.
+//      If dashboard → run fetch dance, return `fetch2bResult`.
+//      If OTP page → return `needsOtp`.
+//   3. submitLoginOtp: fill OTP + submit, watch for dashboard.
+//      Then run fetch dance, return `fetch2bResult`.
+//
+// Per-session state is keyed by sessionId so multiple in-flight flows
+// (different GSTINs in different windows) don't collide.
+
+interface LoginSession {
+  tabId: number;
+  gstin: string;
+  period: string;
+  step: "captcha" | "otp" | "fetch" | "done";
+}
+const loginSessions = new Map<string, LoginSession>();
+
+async function loginAndFetch2b(
+  msg: Extract<ToExtension, { type: "loginAndFetch2b" }>,
+): Promise<FromExtension> {
+  // Already logged in? Skip captcha entirely — silent background fetch.
+  // We need an opener tab on services.gst.gov.in for the popup-window
+  // WAF dance (Playwright knowledge doc §4: "window.open from a
+  // logged-in services.gst.gov.in tab" is the pattern that works).
+  const status = await checkLoginStatus(msg.gstin);
+  if (status.ok && "loggedIn" in status && status.loggedIn) {
+    return await silentFetch2b(msg.period);
+  }
+
+  // Need credentials. If web app didn't pass them, ask for them.
+  if (!msg.username || !msg.password) {
+    return { ok: true, type: "needsCredentials", sessionId: msg.sessionId };
+  }
+
+  // Open the login page. Active = true so the user can see the
+  // browser tab while typing the captcha (the captcha image *also*
+  // ends up in the FillGST modal — visible tab is just for context).
+  const tab = await chrome.tabs.create({
+    url: LOGIN_URL,
+    active: true,
+  });
+  if (!tab.id) {
+    return { ok: false, error: "Could not open login tab" };
+  }
+  await waitForTabLoad(tab.id, 25000);
+
+  // Maybe the login URL redirected us straight to the dashboard
+  // (cookies still alive from a different tab in this profile). Use
+  // that tab as the opener for the gstr2b popup, then close both.
+  const tabAfter = await chrome.tabs.get(tab.id);
+  if (tabAfter.url && /\/auth\/(fowelcome|dashboard)/.test(tabAfter.url)) {
+    const result = await popupAndFetch2b(tab.id, msg.period);
+    await chrome.tabs.remove(tab.id).catch(() => {});
+    return result;
+  }
+
+  // Fill creds + wait for captcha to render + capture as base64.
+  let result: { ok: boolean; captchaImage?: string; error?: string };
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: fillCredsAndCaptureCaptcha,
+      args: [msg.username, msg.password],
+    });
+    result = (r[0]?.result ?? { ok: false, error: "no result" }) as typeof result;
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  if (!result.ok || !result.captchaImage) {
+    return {
+      ok: false,
+      error: result.error ?? "Could not capture captcha",
+    };
+  }
+
+  loginSessions.set(msg.sessionId, {
+    tabId: tab.id,
+    gstin: msg.gstin,
+    period: msg.period,
+    step: "captcha",
+  });
+
+  return {
+    ok: true,
+    type: "needsCaptcha",
+    sessionId: msg.sessionId,
+    captchaImage: result.captchaImage,
+  };
+}
+
+/**
+ * Already-logged-in path: open a hidden services tab to act as opener,
+ * then run the popup WAF dance + fetch. User sees nothing — just the
+ * "Fetched N rows" success message in FillGST. This is the smoothest
+ * UX for repeat fetches within the 30-day session window.
+ */
+async function silentFetch2b(period: string): Promise<FromExtension> {
+  // Find or create an opener tab on services.gst.gov.in. window.open
+  // (and chrome.tabs.create with openerTabId) treats this as a real
+  // user-initiated nav, which the WAF accepts.
+  const existing = await chrome.tabs.query({ url: "https://services.gst.gov.in/*" });
+  let openerTabId = existing[0]?.id;
+  let openerCreated = false;
+  if (!openerTabId) {
+    const opener = await chrome.tabs.create({
+      url: "https://services.gst.gov.in/services/auth/fowelcome",
+      active: false,
+    });
+    if (!opener.id) {
+      return { ok: false, error: "Could not open services.gst.gov.in opener tab" };
+    }
+    openerTabId = opener.id;
+    openerCreated = true;
+    await waitForTabLoad(opener.id, 15000);
+  }
+  const result = await popupAndFetch2b(openerTabId, period);
+  if (openerCreated) {
+    await chrome.tabs.remove(openerTabId).catch(() => {});
+  }
+  return result;
+}
+
+async function submitLoginCaptcha(
+  msg: Extract<ToExtension, { type: "submitLoginCaptcha" }>,
+): Promise<FromExtension> {
+  const session = loginSessions.get(msg.sessionId);
+  if (!session) {
+    return { ok: false, error: "No active login session for this id" };
+  }
+
+  // Fill captcha + click submit.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: session.tabId },
+      func: fillCaptchaAndSubmit,
+      args: [msg.captcha],
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  // Wait for navigation to settle.
+  await sleep(3500);
+
+  const tab = await chrome.tabs.get(session.tabId);
+  const url = tab.url ?? "";
+
+  if (/\/auth\/(fowelcome|dashboard)/.test(url)) {
+    // Logged in. Use the login tab as the WAF-friendly opener for the
+    // gstr2b popup, then close both. User sees the modal flip to "Saving
+    // GSTR-2B…" while this runs in the background.
+    loginSessions.delete(msg.sessionId);
+    const fetchResult = await popupAndFetch2b(session.tabId, session.period);
+    await chrome.tabs.remove(session.tabId).catch(() => {});
+    return fetchResult;
+  }
+
+  // OTP page?
+  let otpVisible = false;
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId: session.tabId },
+      func: checkForOtpField,
+    });
+    otpVisible = !!r[0]?.result?.hasOtp;
+  } catch {
+    // ignore
+  }
+  if (otpVisible) {
+    session.step = "otp";
+    loginSessions.set(msg.sessionId, session);
+    return { ok: true, type: "needsOtp", sessionId: msg.sessionId };
+  }
+
+  // Captcha probably wrong — give the user a fresh one.
+  let fresh: { ok: boolean; captchaImage?: string; error?: string };
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId: session.tabId },
+      func: refreshCaptchaAndCapture,
+      args: [],
+    });
+    fresh = (r[0]?.result ?? { ok: false, error: "no result" }) as typeof fresh;
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+  if (fresh.ok && fresh.captchaImage) {
+    return {
+      ok: true,
+      type: "needsCaptcha",
+      sessionId: msg.sessionId,
+      captchaImage: fresh.captchaImage,
+    };
+  }
+  return { ok: false, error: "Login failed; could not refresh captcha" };
+}
+
+async function submitLoginOtp(
+  msg: Extract<ToExtension, { type: "submitLoginOtp" }>,
+): Promise<FromExtension> {
+  const session = loginSessions.get(msg.sessionId);
+  if (!session) {
+    return { ok: false, error: "No active login session for this id" };
+  }
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: session.tabId },
+      func: fillOtpAndSubmit,
+      args: [msg.otp],
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+  await sleep(3500);
+
+  const tab = await chrome.tabs.get(session.tabId);
+  const url = tab.url ?? "";
+  if (/\/auth\/(fowelcome|dashboard)/.test(url)) {
+    loginSessions.delete(msg.sessionId);
+    const fetchResult = await popupAndFetch2b(session.tabId, session.period);
+    await chrome.tabs.remove(session.tabId).catch(() => {});
+    return fetchResult;
+  }
+  return { ok: false, error: "OTP rejected by GST portal — try again" };
+}
+
+async function cancelLoginFlow(
+  msg: Extract<ToExtension, { type: "cancelLoginFlow" }>,
+): Promise<FromExtension> {
+  const session = loginSessions.get(msg.sessionId);
+  if (session) {
+    await chrome.tabs.remove(session.tabId).catch(() => {});
+    loginSessions.delete(msg.sessionId);
+  }
+  return { ok: true, type: "loginCancelled", sessionId: msg.sessionId };
+}
+
+/**
+ * Run the proven popup-window WAF dance + same-origin fetch.
+ *
+ * Mirrors fillgst-helper-node's fetch2b() (portal-runner.ts line 472+):
+ *   1. From a logged-in services.gst.gov.in tab (the opener), spawn
+ *      a new tab on gstr2b.gst.gov.in/auth/gstr2b/summary. Chrome's
+ *      openerTabId makes this look like a window.open from the
+ *      services tab, which is what GSTN's WAF expects.
+ *   2. Wait for the SPA to load + 5 s for the WAF JS challenge to
+ *      complete and set the gstr2b TS-cookie on this tab's subdomain.
+ *   3. Verify we landed on gstr2b.gst.gov.in (not /accessdenied).
+ *   4. Same-origin fetch from inside the tab — `/gstr2b/auth/api/gstr2b/
+ *      getjson?rtnprd=...` — cookies including the WAF TS-cookie ride
+ *      along automatically.
+ *   5. Close the popup tab.
+ */
+async function popupAndFetch2b(openerTabId: number, period: string): Promise<FromExtension> {
+  const targetUrl = "https://gstr2b.gst.gov.in/gstr2b/auth/gstr2b/summary";
+
+  // CRITICAL: must use window.open() FROM INSIDE the logged-in page's
+  // JS context, not chrome.tabs.create. The WAF distinguishes between
+  // "user navigated by typing in URL bar" (chrome.tabs.create) and
+  // "page invoked window.open from a logged-in same-domain-family tab"
+  // (Playwright's working approach, helper-node line 493-497). Only
+  // the latter passes the JS challenge — the former bounces to
+  // /accessdenied, which is exactly the failure mode v0.7.2 hit.
+  let popupTabId: number | undefined;
+  try {
+    // Snapshot existing gstr2b tab IDs so we can ignore them when
+    // looking for the new popup. window.open from executeScript runs
+    // in MAIN world and Chrome doesn't always set openerTabId — so
+    // we can't rely on that field. We rely instead on (a) the new tab
+    // being created AFTER our snapshot, and (b) it landing on a
+    // gstr2b.gst.gov.in URL.
+    const beforeIds = new Set<number>();
+    const allTabs = await chrome.tabs.query({});
+    for (const t of allTabs) {
+      if (t.id != null) beforeIds.add(t.id);
+    }
+
+    // Race two strategies. Whichever finds the popup first wins:
+    //   A. chrome.tabs.onCreated event listener (catches it instantly
+    //      if openerTabId IS set — fastest path).
+    //   B. Polling chrome.tabs.query for a new tab on a gst.gov.in
+    //      URL (covers the case where openerTabId is missing).
+    let createdHandler: ((t: chrome.tabs.Tab) => void) | undefined;
+    const eventPromise = new Promise<number>((resolve) => {
+      createdHandler = (t: chrome.tabs.Tab) => {
+        if (t.id == null) return;
+        const matches =
+          t.openerTabId === openerTabId ||
+          t.url?.includes("gst.gov.in") ||
+          t.pendingUrl?.includes("gst.gov.in");
+        if (matches) resolve(t.id);
+      };
+      chrome.tabs.onCreated.addListener(createdHandler);
+    });
+
+    const pollPromise = (async (): Promise<number> => {
+      const deadline = Date.now() + 12000;
+      while (Date.now() < deadline) {
+        await sleep(300);
+        const tabs = await chrome.tabs.query({});
+        for (const t of tabs) {
+          if (t.id == null || beforeIds.has(t.id)) continue;
+          const u = t.url ?? t.pendingUrl ?? "";
+          if (u.includes("gst.gov.in")) return t.id;
+        }
+      }
+      throw new Error("polling timed out after 12s");
+    })();
+
+    await chrome.scripting.executeScript({
+      target: { tabId: openerTabId },
+      func: (u: string) => {
+        window.open(u, "_blank");
+      },
+      args: [targetUrl],
+    });
+
+    try {
+      popupTabId = await Promise.race([eventPromise, pollPromise]);
+    } finally {
+      if (createdHandler) {
+        chrome.tabs.onCreated.removeListener(createdHandler);
+      }
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Failed to open gstr2b popup via window.open: ${err instanceof Error ? err.message : String(err)}`,
+      errorCode: "POPUP_OPEN_FAILED",
+    };
+  }
+  try {
+    await waitForTabLoad(popupTabId, 25000);
+  } catch {
+    await chrome.tabs.remove(popupTabId).catch(() => {});
+    return { ok: false, error: "gstr2b popup did not load within 25s", retryable: true };
+  }
+  // 5 s for the WAF JS challenge to set its TS-cookie on .gst.gov.in.
+  await sleep(5000);
+
+  const finalTab = await chrome.tabs.get(popupTabId).catch(() => null);
+  const finalUrl = finalTab?.url ?? "";
+  if (finalUrl.includes("accessdenied") || finalUrl.includes("error/accessdenied")) {
+    await chrome.tabs.remove(popupTabId).catch(() => {});
+    return {
+      ok: false,
+      error:
+        "GSTN bounced to /accessdenied — the account/IP combination is flagged " +
+        "(likely Aadhaar / e-KYC pending or short-term IP throttle from too many automation attempts).",
+      errorCode: "WAF_ACCESSDENIED",
+    };
+  }
+  if (!finalUrl.includes("gstr2b.gst.gov.in")) {
+    await chrome.tabs.remove(popupTabId).catch(() => {});
+    return {
+      ok: false,
+      error: `gstr2b popup landed on unexpected URL: ${finalUrl}`,
+      errorCode: "WAF_UNEXPECTED",
+    };
+  }
+
+  let result: {
+    status: number;
+    ctype: string;
+    body: string;
+    error?: string;
+  };
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId: popupTabId },
+      func: sameOriginFetch2bGetJson,
+      args: [period],
+    });
+    const out = r[0]?.result;
+    if (!out || typeof out !== "object") {
+      await chrome.tabs.remove(popupTabId).catch(() => {});
+      return { ok: false, error: "Popup fetch returned no data", errorCode: "POPUP_EMPTY" };
+    }
+    result = out as typeof result;
+  } catch (err) {
+    await chrome.tabs.remove(popupTabId).catch(() => {});
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  await chrome.tabs.remove(popupTabId).catch(() => {});
+
+  if (result.error) {
+    return { ok: false, error: result.error, errorCode: "FETCH_THREW" };
+  }
+  if (result.status !== 200) {
+    return {
+      ok: false,
+      error: `GSTN returned HTTP ${result.status}. First 200 chars: ${result.body.slice(0, 200)}`,
+      errorCode: `HTTP_${result.status}`,
+      retryable: result.status >= 500,
+    };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.body);
+  } catch {
+    return {
+      ok: false,
+      error: "GSTN returned non-JSON response",
+      errorCode: "PARSE_ERROR",
+    };
+  }
+  return {
+    ok: true,
+    type: "dispatchResult",
+    status: "1",
+    data: (parsed as { data?: unknown })?.data ?? parsed,
+    raw: parsed,
+    endpoint: `https://gstr2b.gst.gov.in/gstr2b/auth/api/gstr2b/getjson?rtnprd=${period}`,
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// ── Page-injected helpers (run inside the login tab, not the SW) ──
+//
+// These functions are serialised by chrome.scripting.executeScript and
+// run in the page's JS context — they can read/write DOM and same-
+// origin resources (captcha image included).
+
+async function fillCredsAndCaptureCaptcha(
+  username: string,
+  password: string,
+): Promise<{ ok: boolean; captchaImage?: string; error?: string }> {
+  try {
+    const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+    const inputs = Array.from(document.querySelectorAll<HTMLInputElement>("input"));
+
+    // Username — heuristic match. Dispatch input + change AND blur — the
+    // GST portal's Angular controller listens on blur to render the
+    // captcha (per knowledge doc §2.5: "Captcha only appears AFTER
+    // typing in the username field").
+    const userField = inputs.find(
+      (i) => /user/i.test(i.id) || /user/i.test(i.name) || /user/i.test(i.placeholder),
+    );
+    if (userField) {
+      userField.focus();
+      userField.value = username;
+      userField.dispatchEvent(new Event("input", { bubbles: true }));
+      userField.dispatchEvent(new Event("change", { bubbles: true }));
+      userField.dispatchEvent(new Event("blur", { bubbles: true }));
+    }
+
+    // Password — GST portal has TWO password fields (one hidden decoy
+    // + the real visible one). Iterate by visibility; first visible wins.
+    for (const candidate of inputs) {
+      if (candidate.type !== "password") continue;
+      const r = candidate.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      const cs = window.getComputedStyle(candidate);
+      if (cs.display === "none" || cs.visibility === "hidden") continue;
+      candidate.focus();
+      candidate.value = password;
+      candidate.dispatchEvent(new Event("input", { bubbles: true }));
+      candidate.dispatchEvent(new Event("change", { bubbles: true }));
+      candidate.dispatchEvent(new Event("blur", { bubbles: true }));
+      break;
+    }
+
+    // Captcha — poll for the img element to be in DOM AND fully loaded
+    // (img.complete + naturalWidth > 0). Up to 8 seconds; the portal
+    // sometimes lags 2-3s after the username blur to swap the captcha src.
+    const captchaSelectors = [
+      "img.captcha-image",
+      "#captchaImg",
+      'img[alt*="captcha" i]',
+      'img[src*="captcha" i]',
+      ".captcha img",
+      "#imgCaptcha",
+    ];
+    let captchaImg: HTMLImageElement | null = null;
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      for (const sel of captchaSelectors) {
+        const el = document.querySelector<HTMLImageElement>(sel);
+        if (el && el.complete && (el.naturalWidth || 0) > 0) {
+          captchaImg = el;
+          break;
+        }
+      }
+      if (captchaImg) break;
+      await wait(300);
+    }
+    if (!captchaImg) {
+      return { ok: false, error: "captcha img did not load within 8s" };
+    }
+
+    // The captcha is same-origin (services.gst.gov.in/services/captcha?...)
+    // so canvas is not tainted. Draw + base64-encode.
+    const canvas = document.createElement("canvas");
+    canvas.width = captchaImg.naturalWidth || captchaImg.width;
+    canvas.height = captchaImg.naturalHeight || captchaImg.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return { ok: false, error: "could not get canvas 2d context" };
+    ctx.drawImage(captchaImg, 0, 0);
+    return { ok: true, captchaImage: canvas.toDataURL("image/png") };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Page-injected fetch — runs in the gstr2b.gst.gov.in popup context.
+ * Same-origin relative URL means cookies (including the WAF TS-cookie
+ * just minted by the JS challenge) attach automatically.
+ */
+function sameOriginFetch2bGetJson(
+  period: string,
+): Promise<{ status: number; ctype: string; body: string; error?: string }> {
+  return (async () => {
+    try {
+      const r = await fetch(`/gstr2b/auth/api/gstr2b/getjson?rtnprd=${period}`, {
+        credentials: "include",
+        headers: { Accept: "application/json" },
+      });
+      return {
+        status: r.status,
+        ctype: r.headers.get("content-type") ?? "",
+        body: await r.text(),
+      };
+    } catch (err) {
+      return {
+        status: 0,
+        ctype: "",
+        body: "",
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  })();
+}
+
+function fillCaptchaAndSubmit(captcha: string): { ok: boolean; error?: string } {
+  try {
+    const inputs = Array.from(document.querySelectorAll<HTMLInputElement>("input"));
+    const captchaField = inputs.find(
+      (i) =>
+        /captcha/i.test(i.id) ||
+        /captcha/i.test(i.name) ||
+        /captcha/i.test(i.placeholder) ||
+        /characters/i.test(i.placeholder),
+    );
+    if (!captchaField) return { ok: false, error: "captcha input not found" };
+    captchaField.focus();
+    captchaField.value = captcha;
+    captchaField.dispatchEvent(new Event("input", { bubbles: true }));
+    captchaField.dispatchEvent(new Event("change", { bubbles: true }));
+    // Submit. Try button[type=submit] first, then any visible "Login" button.
+    let submitBtn: HTMLButtonElement | null =
+      document.querySelector<HTMLButtonElement>('button[type="submit"]');
+    if (!submitBtn) {
+      const candidates = Array.from(document.querySelectorAll<HTMLButtonElement>("button"));
+      submitBtn = candidates.find((b) => /login|sign\s*in|submit/i.test(b.textContent ?? "")) ?? null;
+    }
+    if (!submitBtn) return { ok: false, error: "submit button not found" };
+    submitBtn.click();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+function checkForOtpField(): { hasOtp: boolean } {
+  const otp = document.querySelector(
+    'input[name="otp"], #otp, input[placeholder*="OTP" i], input[id*="otp" i]',
+  );
+  return { hasOtp: !!otp };
+}
+
+function refreshCaptchaAndCapture(): {
+  ok: boolean;
+  captchaImage?: string;
+  error?: string;
+} {
+  try {
+    // Most login pages have a refresh-captcha icon. Click it; otherwise
+    // just re-capture the current image (which the form might have
+    // refreshed automatically on bad submit).
+    const refresh = document.querySelector<HTMLElement>(
+      '[onclick*="captcha" i], .captcha-refresh, #captchaRefresh, a[title*="captcha" i]',
+    );
+    if (refresh) refresh.click();
+    const captchaSelectors = [
+      "img.captcha-image",
+      "#captchaImg",
+      'img[alt*="captcha" i]',
+      'img[src*="captcha" i]',
+      ".captcha img",
+      "#imgCaptcha",
+    ];
+    let captchaImg: HTMLImageElement | null = null;
+    for (const sel of captchaSelectors) {
+      const el = document.querySelector<HTMLImageElement>(sel);
+      if (el) {
+        captchaImg = el;
+        break;
+      }
+    }
+    if (!captchaImg) {
+      return { ok: false, error: "captcha img not found after refresh" };
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = captchaImg.naturalWidth || captchaImg.width;
+    canvas.height = captchaImg.naturalHeight || captchaImg.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return { ok: false, error: "could not get canvas 2d context" };
+    ctx.drawImage(captchaImg, 0, 0);
+    return { ok: true, captchaImage: canvas.toDataURL("image/png") };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+function fillOtpAndSubmit(otp: string): { ok: boolean; error?: string } {
+  try {
+    const otpField =
+      document.querySelector<HTMLInputElement>('input[name="otp"]') ||
+      document.querySelector<HTMLInputElement>("#otp") ||
+      document.querySelector<HTMLInputElement>('input[placeholder*="OTP" i]') ||
+      document.querySelector<HTMLInputElement>('input[id*="otp" i]');
+    if (!otpField) return { ok: false, error: "otp input not found" };
+    otpField.focus();
+    otpField.value = otp;
+    otpField.dispatchEvent(new Event("input", { bubbles: true }));
+    otpField.dispatchEvent(new Event("change", { bubbles: true }));
+    let submitBtn: HTMLButtonElement | null =
+      document.querySelector<HTMLButtonElement>('button[type="submit"]');
+    if (!submitBtn) {
+      const candidates = Array.from(document.querySelectorAll<HTMLButtonElement>("button"));
+      submitBtn = candidates.find((b) => /verify|submit|continue/i.test(b.textContent ?? "")) ?? null;
+    }
+    if (!submitBtn) return { ok: false, error: "submit button not found" };
+    submitBtn.click();
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
@@ -324,6 +1005,54 @@ async function logout(gstin: string): Promise<FromExtension> {
 
 // ── Helpers ─────────────────────────────────────────────────
 
+/**
+ * Find an existing tab on `origin` (e.g. "https://gstr2b.gst.gov.in") or
+ * open a fresh one. For gstr2b.gst.gov.in we navigate via the portal-link
+ * chain (services → returns dashboard → gstr2b summary) so GSTN's WAF
+ * sees a legitimate Referer chain and runs its JS challenge against the
+ * new tab — the resulting cookie is what unlocks subsequent same-origin
+ * fetch() calls. Direct chrome.tabs.create({ url: gstr2b.gst.gov.in })
+ * triggers "Access Denied" because GSTN's WAF rejects the navigation.
+ *
+ * For other origins (services / return) a direct create+load is fine
+ * because the FillGST helper extension has already established cookies
+ * via the login flow and those subdomains don't have the gstr2b tier
+ * of WAF protection.
+ */
+async function findOrCreateTabOnOrigin(origin: string): Promise<number | undefined> {
+  const existing = await chrome.tabs.query({ url: `${origin}/*` });
+  if (existing.length > 0 && existing[0]?.id) return existing[0].id;
+
+  if (origin === "https://gstr2b.gst.gov.in") {
+    // WAF dance: navigate via the returns dashboard so the Referer chain
+    // matches what a real user would produce. We open a single tab and
+    // navigate it through the chain by chrome.tabs.update to avoid
+    // popup-blocking (popups from a SW are flaky in MV3).
+    const tab = await chrome.tabs.create({
+      url: "https://return.gst.gov.in/returns/auth/dashboard",
+      active: false,
+    });
+    if (!tab.id) return undefined;
+    await waitForTabLoad(tab.id, 20000);
+
+    // Now point the same tab at the gstr2b summary page. The WAF JS
+    // challenge runs against this navigation; the validation cookie
+    // sticks on .gst.gov.in for ~30 minutes, which is plenty for the
+    // single fetch we're about to make.
+    await chrome.tabs.update(tab.id, {
+      url: "https://gstr2b.gst.gov.in/gstr2b/auth/gstr2b/summary",
+    });
+    await waitForTabLoad(tab.id, 25000);
+    return tab.id;
+  }
+
+  // services.* / return.* / einvoice.* — direct navigation works.
+  const tab = await chrome.tabs.create({ url: `${origin}/`, active: false });
+  if (!tab.id) return undefined;
+  await waitForTabLoad(tab.id, 20000);
+  return tab.id;
+}
+
 function waitForTabLoad(tabId: number, timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
@@ -378,11 +1107,16 @@ function urlForDispatch(msg: Extract<ToExtension, { type: "dispatch" }>): {
   const period = msg.period ? remapQuarter(msg.period) : undefined;
   const params = new URLSearchParams(msg.params ?? {});
 
-  if (msg.formNo === "2b" && msg.action === "B2B") {
+  // GSTR-2B fetch via either the new "GET_GSTR2B" verb (from FillGST web app)
+  // or the legacy "B2B" action. Both target gstr2b.gst.gov.in. The actual
+  // JSON-bearing endpoint is /api/gstr2b/getjson (verified against the live
+  // portal by the GST-PORTAL-AUTOMATION-KNOWLEDGE doc — getjson and getdata
+  // return identical bytes; getjson is what the Download page uses).
+  if (msg.formNo === "2b" && (msg.action === "GET_GSTR2B" || msg.action === "B2B")) {
     if (period) params.set("rtnprd", period);
     const qs = params.toString();
     return {
-      url: `https://gstr2b.gst.gov.in/gstr2b/auth/gstr2bdwld${qs ? "?" + qs : ""}`,
+      url: `https://gstr2b.gst.gov.in/gstr2b/auth/api/gstr2b/getjson${qs ? "?" + qs : ""}`,
       referer: "https://return.gst.gov.in/returns/auth/dashboard",
     };
   }
@@ -410,22 +1144,23 @@ function urlForDispatch(msg: Extract<ToExtension, { type: "dispatch" }>): {
 async function dispatchAction(
   msg: Extract<ToExtension, { type: "dispatch" }>,
 ): Promise<FromExtension> {
-  // Need an authenticated tab so the same-origin fetch carries cookies.
-  const tabs = await chrome.tabs.query({ url: "https://*.gst.gov.in/*" });
-  let tabId = tabs[0]?.id;
-  if (!tabId) {
-    const tab = await chrome.tabs.create({
-      url: "https://return.gst.gov.in/returns/auth/dashboard",
-      active: false,
-    });
-    if (!tab.id) {
-      return { ok: false, error: "Could not open a portal tab to dispatch through" };
-    }
-    tabId = tab.id;
-    await waitForTabLoad(tabId, 20000);
-  }
-
   const { url, referer } = urlForDispatch(msg);
+
+  // Determine which subdomain the target URL is on. The injected fetch()
+  // runs in the tab's JS context — for it to be SAME-ORIGIN with `url`
+  // (cookies sent, no CORS preflight, WAF JS-challenge cookie present),
+  // the tab itself must be on the same subdomain.
+  //
+  // GSTR-2B has its own subdomain (gstr2b.gst.gov.in) with an Akamai WAF
+  // JS-challenge that only sets the validation cookie when a real Chrome
+  // page loads ON that subdomain. Reusing a return.gst.gov.in tab gives
+  // a cross-origin fetch to gstr2b → "Failed to fetch". Reference:
+  // testing innovations/gst portal automation knowledge §4.
+  const targetOrigin = new URL(url).origin;
+  let tabId = await findOrCreateTabOnOrigin(targetOrigin);
+  if (!tabId) {
+    return { ok: false, error: `Could not open a tab on ${targetOrigin}` };
+  }
 
   try {
     const result = await chrome.scripting.executeScript({
