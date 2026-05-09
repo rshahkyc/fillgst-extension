@@ -1,9 +1,18 @@
-# GSTR-2B without-OTP fetch — recovery guide
+# GSTR-2B without-OTP fetch — extension recovery guide
 
-If the without-OTP GSTR-2B fetch breaks, this is the canonical recovery
-checkpoint. Mastered and verified end-to-end on **2026-05-10** with
-extension v0.7.5+. Do NOT refactor the WAF dance code without reading
-this document end-to-end first.
+> **2026-05-10 status:** This extension is the **fallback path** for GSTR-2B
+> fetch. The PRIMARY path is now `fillgst-helper-node` running Playwright
+> headless at `localhost:9876` (zero Chrome windows). The extension was
+> retired from the FillGST webapp picker. This doc is preserved so the
+> extension path can be revived if helper-node ever can't be used (locked-down
+> corporate IT, etc.). Frozen working state is git tag `v0.7.9` at commit
+> `fb80821`.
+
+If the without-OTP GSTR-2B fetch breaks AND the user can't use helper-node,
+this is the canonical recovery checkpoint for the extension path. Mastered
+and verified end-to-end on **2026-05-10** with extension v0.7.5–v0.7.9.
+Do NOT refactor the WAF dance code without reading this document end-to-end
+first.
 
 ## TL;DR
 
@@ -11,11 +20,15 @@ FillGST extension v0.7.5+ + the FillGST webapp can fetch GSTR-2B JSON
 from the GST portal **without OTP**, **without GSP fees**, and **without
 server-side Playwright**. Verified across:
 
-| Path | Period | Time | Rows |
-|---|---|---|---|
-| Warm (cookies still valid) | Dec-2025 | ~12 s | 3 |
-| Warm | Jul-2025 | ~12 s | 10 |
-| **Cold (browser fully closed first)** | Sep-2025 | ~22 s | 19 (₹47.86 L taxable) |
+| Path | Period | Time | Rows | Visibility |
+|---|---|---|---|---|
+| Warm (cookies still valid) | Dec-2025 | ~12 s | 3 | Brief tab flash |
+| Warm | Jul-2025 | ~12 s | 10 | Brief tab flash |
+| Cold (browser fully closed first) | Sep-2025 | ~22 s | 19 (₹47.86 L taxable) | Login + popup tabs visible |
+| **v0.7.9 minimized window** | confirmed | ~22 s | n/a | **Taskbar entry only — no main-window flash** |
+
+For truly invisible fetch (zero Chrome windows), see helper-node primary path
+documented in `~/.claude/.../memory/project_fetch_2b_mastered.md`.
 
 ## The single hardest insight (do not lose)
 
