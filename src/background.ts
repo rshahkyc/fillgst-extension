@@ -106,6 +106,7 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
 
 interface LoginSession {
   tabId: number;
+  windowId?: number;
   gstin: string;
   period: string;
   step: "captcha" | "otp" | "fetch" | "done";
@@ -115,52 +116,63 @@ const loginSessions = new Map<string, LoginSession>();
 async function loginAndFetch2b(
   msg: Extract<ToExtension, { type: "loginAndFetch2b" }>,
 ): Promise<FromExtension> {
-  // Already logged in? Skip captcha entirely — silent background fetch.
-  // We need an opener tab on services.gst.gov.in for the popup-window
-  // WAF dance (Playwright knowledge doc §4: "window.open from a
-  // logged-in services.gst.gov.in tab" is the pattern that works).
-  const status = await checkLoginStatus(msg.gstin);
-  if (status.ok && "loggedIn" in status && status.loggedIn) {
-    return await silentFetch2b(msg.period);
-  }
+  // v0.7.8: NO warm-path shortcut. Even if cookies appear valid, GSTN
+  // can have stale subdomain sessions where services.gst.gov.in is
+  // logged in but gstr2b.gst.gov.in's WAF refuses to grant a TS-cookie
+  // — popup bounces to /error/accessdenied. Force the captcha-login
+  // flow every time to re-establish the gstr2b session cleanly. Slower
+  // (captcha required) but eliminates the false-positive logged-in
+  // failure mode that v0.7.5/v0.7.7 hit.
 
   // Need credentials. If web app didn't pass them, ask for them.
   if (!msg.username || !msg.password) {
     return { ok: true, type: "needsCredentials", sessionId: msg.sessionId };
   }
 
-  // Open the login page. Active = true so the user can see the
-  // browser tab while typing the captcha (the captcha image *also*
-  // ends up in the FillGST modal — visible tab is just for context).
-  const tab = await chrome.tabs.create({
+  // v0.7.9: open the login page in a SEPARATE minimized Chrome window
+  // instead of a tab in the user's main window. The page renders
+  // normally inside the minimized window — JS executes, captcha img
+  // loads, all WAF challenges complete — but the user never sees the
+  // tab pop into their workspace. v0.7.6 tried `active: false` in the
+  // main window and the WAF bounced (focus/visibility check); a
+  // top-level minimized window is treated differently because it's
+  // its own Chrome window with full rendering, just off-screen. The
+  // gstr2b popup spawned later via window.open joins the same window.
+  const win = await chrome.windows.create({
     url: LOGIN_URL,
-    active: true,
+    type: "normal",
+    state: "minimized",
+    focused: false,
   });
-  if (!tab.id) {
-    return { ok: false, error: "Could not open login tab" };
+  const tabId = win.tabs?.[0]?.id;
+  const windowId = win.id;
+  if (!tabId || windowId == null) {
+    return { ok: false, error: "Could not open login window" };
   }
-  await waitForTabLoad(tab.id, 25000);
+  await waitForTabLoad(tabId, 25000);
 
-  // Maybe the login URL redirected us straight to the dashboard
-  // (cookies still alive from a different tab in this profile). Use
-  // that tab as the opener for the gstr2b popup, then close both.
-  const tabAfter = await chrome.tabs.get(tab.id);
-  if (tabAfter.url && /\/auth\/(fowelcome|dashboard)/.test(tabAfter.url)) {
-    const result = await popupAndFetch2b(tab.id, msg.period);
-    await chrome.tabs.remove(tab.id).catch(() => {});
-    return result;
+  // If the login URL redirected to /auth (cookies still valid),
+  // navigate back to /services/login to force a fresh captcha-driven
+  // login. This re-establishes the GSTN session cleanly and gives
+  // gstr2b.gst.gov.in a chance to mint a fresh TS-cookie when the
+  // popup later opens.
+  const tabAfter = await chrome.tabs.get(tabId);
+  if (tabAfter.url && /\/auth\//.test(tabAfter.url)) {
+    await chrome.tabs.update(tabId, { url: LOGIN_URL });
+    await waitForTabLoad(tabId, 25000);
   }
 
   // Fill creds + wait for captcha to render + capture as base64.
   let result: { ok: boolean; captchaImage?: string; error?: string };
   try {
     const r = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId },
       func: fillCredsAndCaptureCaptcha,
       args: [msg.username, msg.password],
     });
     result = (r[0]?.result ?? { ok: false, error: "no result" }) as typeof result;
   } catch (err) {
+    await chrome.windows.remove(windowId).catch(() => {});
     return {
       ok: false,
       error: err instanceof Error ? err.message : String(err),
@@ -168,6 +180,7 @@ async function loginAndFetch2b(
   }
 
   if (!result.ok || !result.captchaImage) {
+    await chrome.windows.remove(windowId).catch(() => {});
     return {
       ok: false,
       error: result.error ?? "Could not capture captcha",
@@ -175,7 +188,8 @@ async function loginAndFetch2b(
   }
 
   loginSessions.set(msg.sessionId, {
-    tabId: tab.id,
+    tabId,
+    windowId,
     gstin: msg.gstin,
     period: msg.period,
     step: "captcha",
@@ -243,19 +257,32 @@ async function submitLoginCaptcha(
     };
   }
 
-  // Wait for navigation to settle.
-  await sleep(3500);
+  // v0.7.8: actively poll for the post-login URL to settle on /auth/*
+  // (up to 15 s) instead of a fixed 3.5 s sleep. The auth handshake
+  // chain is: POST /services/Authentication → 302 /services/auth/
+  // fowelcome → may redirect again to /services/auth/dashboard. The
+  // 3.5 s window was enough most of the time but occasionally fired
+  // the popup before the cookies propagated to gstr2b.gst.gov.in.
+  const settledUrl = await waitForUrlMatch(
+    session.tabId,
+    /\/auth\/(fowelcome|dashboard)/,
+    15000,
+  );
 
-  const tab = await chrome.tabs.get(session.tabId);
-  const url = tab.url ?? "";
-
-  if (/\/auth\/(fowelcome|dashboard)/.test(url)) {
-    // Logged in. Use the login tab as the WAF-friendly opener for the
-    // gstr2b popup, then close both. User sees the modal flip to "Saving
-    // GSTR-2B…" while this runs in the background.
+  if (settledUrl) {
+    // Logged in. Wait an extra 4 s for cross-subdomain cookies (the
+    // gstr2b TS-cookie ride) to propagate before launching the popup.
+    // Without this, the popup races GSTN's cookie-set and bounces.
+    await sleep(4000);
     loginSessions.delete(msg.sessionId);
     const fetchResult = await popupAndFetch2b(session.tabId, session.period);
-    await chrome.tabs.remove(session.tabId).catch(() => {});
+    // v0.7.9: close the entire minimized window in one go (covers the
+    // login tab + popup tab + any incidental tabs Chrome added).
+    if (session.windowId != null) {
+      await chrome.windows.remove(session.windowId).catch(() => {});
+    } else {
+      await chrome.tabs.remove(session.tabId).catch(() => {});
+    }
     return fetchResult;
   }
 
@@ -322,17 +349,49 @@ async function submitLoginOtp(
       error: err instanceof Error ? err.message : String(err),
     };
   }
-  await sleep(3500);
-
-  const tab = await chrome.tabs.get(session.tabId);
-  const url = tab.url ?? "";
-  if (/\/auth\/(fowelcome|dashboard)/.test(url)) {
+  // Same URL-poll + propagation-wait pattern as submitLoginCaptcha.
+  const settledUrl = await waitForUrlMatch(
+    session.tabId,
+    /\/auth\/(fowelcome|dashboard)/,
+    15000,
+  );
+  if (settledUrl) {
+    await sleep(4000);
     loginSessions.delete(msg.sessionId);
     const fetchResult = await popupAndFetch2b(session.tabId, session.period);
-    await chrome.tabs.remove(session.tabId).catch(() => {});
+    if (session.windowId != null) {
+      await chrome.windows.remove(session.windowId).catch(() => {});
+    } else {
+      await chrome.tabs.remove(session.tabId).catch(() => {});
+    }
     return fetchResult;
   }
   return { ok: false, error: "OTP rejected by GST portal — try again" };
+}
+
+/**
+ * Poll chrome.tabs.get(tabId).url every 250ms up to deadlineMs for a
+ * URL matching the regex. Returns the matched URL on success, or
+ * undefined on timeout. Used to wait for the post-login redirect chain
+ * to settle on /auth/(fowelcome|dashboard).
+ */
+async function waitForUrlMatch(
+  tabId: number,
+  pattern: RegExp,
+  deadlineMs: number,
+): Promise<string | undefined> {
+  const deadline = Date.now() + deadlineMs;
+  while (Date.now() < deadline) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      const u = t.url ?? "";
+      if (pattern.test(u)) return u;
+    } catch {
+      // Tab may have closed; just retry until deadline.
+    }
+    await sleep(250);
+  }
+  return undefined;
 }
 
 async function cancelLoginFlow(
@@ -340,7 +399,11 @@ async function cancelLoginFlow(
 ): Promise<FromExtension> {
   const session = loginSessions.get(msg.sessionId);
   if (session) {
-    await chrome.tabs.remove(session.tabId).catch(() => {});
+    if (session.windowId != null) {
+      await chrome.windows.remove(session.windowId).catch(() => {});
+    } else {
+      await chrome.tabs.remove(session.tabId).catch(() => {});
+    }
     loginSessions.delete(msg.sessionId);
   }
   return { ok: true, type: "loginCancelled", sessionId: msg.sessionId };
@@ -433,6 +496,14 @@ async function popupAndFetch2b(openerTabId: number, period: string): Promise<Fro
         chrome.tabs.onCreated.removeListener(createdHandler);
       }
     }
+    // v0.7.6 tried chrome.tabs.update(popupTabId, {active: false})
+    // to hide the popup — GSTN's WAF bounced because that flips the
+    // page-visibility flag the bot detector reads. v0.7.9 keeps the
+    // popup active inside its window, but the parent window was
+    // opened minimized via chrome.windows.create — Chrome keeps a
+    // minimized window minimized when a new tab spawns inside it,
+    // so the popup stays hidden without us toggling visibility flags
+    // that would trip the WAF.
   } catch (err) {
     return {
       ok: false,
