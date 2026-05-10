@@ -72,6 +72,23 @@ export type ToExtension =
   | { type: "submitLoginCaptcha"; sessionId: string; captcha: string }
   | { type: "submitLoginOtp"; sessionId: string; otp: string }
   | { type: "cancelLoginFlow"; sessionId: string }
+  // Auto-login + fetch-IMS in one flow. Same login state machine as
+  // loginAndFetch2b — the only difference is the fetch step. After
+  // login lands on services.gst.gov.in/auth/dashboard, the same login
+  // tab is navigated to return.gst.gov.in/returns/auth/dashboard so
+  // subsequent in-page fetches to /imsweb/auth/api/ims/... are
+  // same-origin. We then iterate the inward sections (B2B / B2BA /
+  // B2BCN / B2BCNA / B2BDN / B2BDNA / ECOM / ECOMA), assemble a
+  // GETINV envelope, and return it via `imsResult`. Web app POSTs
+  // the envelope to /api/ims/upload for parse + persist.
+  | {
+      type: "loginAndFetchIms";
+      sessionId: string;
+      gstin: string;
+      period: string;
+      username?: string;
+      password?: string;
+    }
   | { type: "keepalive"; gstin: string }
   | { type: "logout"; gstin: string };
 
@@ -97,6 +114,17 @@ export type FromExtension =
   | { ok: true; type: "loginStatus"; loggedIn: boolean; cookieCount: number }
   | { ok: true; type: "loginOpened"; tabId: number; message: string }
   | { ok: true; type: "fetch2bResult"; data: unknown; size: number }
+  // Result of loginAndFetchIms — `envelope` is a GETINV-shaped object
+  // ready to POST to the web app's /api/ims/upload. `rowCount` is the
+  // total invoices across the populated sections. `fetchedSections` is
+  // the count of non-empty sections that produced rows.
+  | {
+      ok: true;
+      type: "fetchImsResult";
+      envelope: unknown;
+      rowCount: number;
+      fetchedSections: number;
+    }
   // Auto-login mid-flow states. The web app shows the captcha image in
   // the FillGST modal, captures the user's typed text, and sends it
   // back via `submitLoginCaptcha`. Same for OTP. `needsCredentials`
@@ -127,7 +155,7 @@ export type FromExtension =
     };
 
 export const EXTENSION_NAME = "FillGST Helper";
-export const EXTENSION_VERSION = "0.7.9";
+export const EXTENSION_VERSION = "0.8.0";
 
 /**
  * Stable Chrome extension ID, deterministically derived from the public

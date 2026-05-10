@@ -72,6 +72,9 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
     case "loginAndFetch2b":
       return loginAndFetch2b(message);
 
+    case "loginAndFetchIms":
+      return loginAndFetchIms(message);
+
     case "submitLoginCaptcha":
       return submitLoginCaptcha(message);
 
@@ -109,6 +112,12 @@ interface LoginSession {
   windowId?: number;
   gstin: string;
   period: string;
+  /**
+   * Which fetch operation runs after login lands on /auth/dashboard.
+   * v0.8.0 added "ims"; "2b" is the original. Both share the same
+   * captcha + OTP flow; only the post-login fetch step differs.
+   */
+  kind: "2b" | "ims";
   step: "captcha" | "otp" | "fetch" | "done";
 }
 const loginSessions = new Map<string, LoginSession>();
@@ -192,6 +201,84 @@ async function loginAndFetch2b(
     windowId,
     gstin: msg.gstin,
     period: msg.period,
+    kind: "2b",
+    step: "captcha",
+  });
+
+  return {
+    ok: true,
+    type: "needsCaptcha",
+    sessionId: msg.sessionId,
+    captchaImage: result.captchaImage,
+  };
+}
+
+/**
+ * v0.8.0 — Auto-login + IMS-fetch orchestrator.
+ *
+ * Same login state machine as loginAndFetch2b — opens a hidden
+ * minimized window, fills creds, captures captcha, returns it via
+ * needsCaptcha, accepts the user's solve via submitLoginCaptcha (and
+ * optionally submitLoginOtp). The only difference is the post-login
+ * fetch step: instead of the gstr2b popup-WAF dance, we navigate the
+ * SAME tab cross-subdomain to return.gst.gov.in/returns/auth/dashboard
+ * and run multi-section in-tab fetches against /imsweb/auth/api/ims/...
+ * (no WAF JS challenge needed for this subdomain — just session
+ * cookies + same-origin).
+ *
+ * Web app POSTs the resulting envelope to /api/ims/upload to persist.
+ */
+async function loginAndFetchIms(
+  msg: Extract<ToExtension, { type: "loginAndFetchIms" }>,
+): Promise<FromExtension> {
+  if (!msg.username || !msg.password) {
+    return { ok: true, type: "needsCredentials", sessionId: msg.sessionId };
+  }
+
+  const win = await chrome.windows.create({
+    url: LOGIN_URL,
+    type: "normal",
+    state: "minimized",
+    focused: false,
+  });
+  const tabId = win.tabs?.[0]?.id;
+  const windowId = win.id;
+  if (!tabId || windowId == null) {
+    return { ok: false, error: "Could not open login window" };
+  }
+  await waitForTabLoad(tabId, 25000);
+
+  // If cookies are still valid, login URL redirects to /auth/...; force
+  // a fresh captcha-driven login to re-establish a clean session.
+  const tabAfter = await chrome.tabs.get(tabId);
+  if (tabAfter.url && /\/auth\//.test(tabAfter.url)) {
+    await chrome.tabs.update(tabId, { url: LOGIN_URL });
+    await waitForTabLoad(tabId, 25000);
+  }
+
+  let result: { ok: boolean; captchaImage?: string; error?: string };
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: fillCredsAndCaptureCaptcha,
+      args: [msg.username, msg.password],
+    });
+    result = (r[0]?.result ?? { ok: false, error: "no result" }) as typeof result;
+  } catch (err) {
+    await chrome.windows.remove(windowId).catch(() => {});
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  if (!result.ok || !result.captchaImage) {
+    await chrome.windows.remove(windowId).catch(() => {});
+    return { ok: false, error: result.error ?? "Could not capture captcha" };
+  }
+
+  loginSessions.set(msg.sessionId, {
+    tabId,
+    windowId,
+    gstin: msg.gstin,
+    period: msg.period,
+    kind: "ims",
     step: "captcha",
   });
 
@@ -275,7 +362,7 @@ async function submitLoginCaptcha(
     // Without this, the popup races GSTN's cookie-set and bounces.
     await sleep(4000);
     loginSessions.delete(msg.sessionId);
-    const fetchResult = await popupAndFetch2b(session.tabId, session.period);
+    const fetchResult = await runPostLoginFetch(session);
     // v0.7.9: close the entire minimized window in one go (covers the
     // login tab + popup tab + any incidental tabs Chrome added).
     if (session.windowId != null) {
@@ -358,7 +445,7 @@ async function submitLoginOtp(
   if (settledUrl) {
     await sleep(4000);
     loginSessions.delete(msg.sessionId);
-    const fetchResult = await popupAndFetch2b(session.tabId, session.period);
+    const fetchResult = await runPostLoginFetch(session);
     if (session.windowId != null) {
       await chrome.windows.remove(session.windowId).catch(() => {});
     } else {
@@ -367,6 +454,21 @@ async function submitLoginOtp(
     return fetchResult;
   }
   return { ok: false, error: "OTP rejected by GST portal — try again" };
+}
+
+/**
+ * Dispatch to the right post-login fetch based on session.kind.
+ * Both kinds use the same login state machine; only the fetch step
+ * differs:
+ *   - "2b"   → popup-window WAF dance against gstr2b.gst.gov.in
+ *   - "ims"  → in-tab navigation to return.gst.gov.in then per-section
+ *              same-origin fetch via /imsweb/auth/api/ims/...
+ */
+async function runPostLoginFetch(session: LoginSession): Promise<FromExtension> {
+  if (session.kind === "ims") {
+    return fetchImsViaTab(session.tabId, session.gstin, session.period);
+  }
+  return popupAndFetch2b(session.tabId, session.period);
 }
 
 /**
@@ -602,6 +704,233 @@ async function popupAndFetch2b(openerTabId: number, period: string): Promise<Fro
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * v0.8.0 — IMS fetcher (in-tab variant, no popup).
+ *
+ * After login lands on services.gst.gov.in/auth/dashboard, navigates
+ * the same login tab to return.gst.gov.in/returns/auth/dashboard so
+ * subsequent fetches to /imsweb/auth/api/ims/... are same-origin (no
+ * CORS bounce). Then iterates the 8 inward sections, assembles a
+ * GETINV envelope, and returns it.
+ *
+ * Why same tab + cross-subdomain navigation (not a popup like 2B):
+ * gstr2b.gst.gov.in has its own WAF JS challenge that needs the
+ * window.open dance to set the per-tab TS-cookie. return.gst.gov.in
+ * has no such challenge — just session cookies on the .gst.gov.in
+ * apex, which transfer when we navigate via window.location.href.
+ */
+async function fetchImsViaTab(
+  tabId: number,
+  gstin: string,
+  period: string,
+): Promise<FromExtension> {
+  const RETURNS_DASH = "https://return.gst.gov.in/returns/auth/dashboard";
+
+  // Navigate same tab to return.gst.gov.in. Use window.location.href
+  // (in-page JS nav) instead of chrome.tabs.update — preserves the
+  // referer + behaves identically to a real user click.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (u: string) => {
+        window.location.href = u;
+      },
+      args: [RETURNS_DASH],
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorCode: "IMS_NAV_FAILED",
+    };
+  }
+  try {
+    await waitForTabLoad(tabId, 25000);
+  } catch {
+    return {
+      ok: false,
+      error: "return.gst.gov.in dashboard did not load within 25s",
+      errorCode: "IMS_NAV_TIMEOUT",
+      retryable: true,
+    };
+  }
+  // Settle for cookies + SPA bootstrap.
+  await sleep(2000);
+
+  const finalTab = await chrome.tabs.get(tabId).catch(() => null);
+  const finalUrl = finalTab?.url ?? "";
+  if (finalUrl.includes("accessdenied") || finalUrl.includes("error/accessdenied")) {
+    return {
+      ok: false,
+      error: "GSTN bounced /returns/auth/dashboard to /accessdenied",
+      errorCode: "WAF_ACCESSDENIED",
+    };
+  }
+  if (!finalUrl.includes("return.gst.gov.in")) {
+    return {
+      ok: false,
+      error: `Expected to land on return.gst.gov.in, got: ${finalUrl}`,
+      errorCode: "IMS_UNEXPECTED_URL",
+    };
+  }
+
+  // Multi-section fetch in-page. Returns the envelope ready for
+  // /api/ims/upload.
+  let result: { envelope: Record<string, unknown>; rowCount: number; fetchedSections: number; firstError: string | null };
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: sameOriginFetchImsSections,
+      args: [gstin, period],
+    });
+    const out = r[0]?.result;
+    if (!out || typeof out !== "object") {
+      return { ok: false, error: "IMS fetch returned no data", errorCode: "IMS_EMPTY" };
+    }
+    result = out as typeof result;
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorCode: "IMS_FETCH_THREW",
+    };
+  }
+
+  if (result.rowCount === 0 && result.firstError) {
+    return {
+      ok: false,
+      error: result.firstError,
+      errorCode: "IMS_FETCH_FAILED",
+      retryable: true,
+    };
+  }
+
+  return {
+    ok: true,
+    type: "fetchImsResult",
+    envelope: result.envelope,
+    rowCount: result.rowCount,
+    fetchedSections: result.fetchedSections,
+  };
+}
+
+/**
+ * Page-injected — runs inside return.gst.gov.in. Calls each IMS
+ * section endpoint with the page's session cookies (same-origin),
+ * assembles a GETINV envelope, and returns it.
+ *
+ * Section response shape (verified 2026-05-10 against live portal):
+ *   - getCount?goods_typ=ALL_OTH → { data: { all_oth: { b2b: {...},
+ *       b2ba: {...}, ..., ttl_cnt }, imp_gds, inv_supp_isd, ... } }
+ *   - getInvoices?gstin=...&section=B2B → { data: { b2b: [...] } }
+ *
+ * Section param to getInvoices is uppercase (B2B, B2BA, ...). Envelope
+ * keys + count keys are lowercase. We only fetch sections with > 0
+ * rows per the count call to save round-trips.
+ */
+function sameOriginFetchImsSections(
+  gstin: string,
+  period: string,
+): Promise<{
+  envelope: Record<string, unknown>;
+  rowCount: number;
+  fetchedSections: number;
+  firstError: string | null;
+}> {
+  return (async () => {
+    const SECTIONS = [
+      "B2B",
+      "B2BA",
+      "B2BCN",
+      "B2BCNA",
+      "B2BDN",
+      "B2BDNA",
+      "ECOM",
+      "ECOMA",
+    ];
+    const ENV_KEY: Record<string, string> = {
+      B2B: "b2b",
+      B2BA: "b2ba",
+      B2BCN: "b2bcn",
+      B2BCNA: "b2bcna",
+      B2BDN: "b2bdn",
+      B2BDNA: "b2bdna",
+      ECOM: "ecom",
+      ECOMA: "ecoma",
+    };
+
+    const envelope: Record<string, unknown> = { gstin, rtnprd: period };
+    let rowCount = 0;
+    let fetchedSections = 0;
+    let firstError: string | null = null;
+
+    // 1. Section counts.
+    const sectionCounts = new Map<string, number>();
+    try {
+      const r = await fetch(
+        "/imsweb/auth/api/ims/getCount?goods_typ=ALL_OTH",
+        { credentials: "include", headers: { Accept: "application/json" } },
+      );
+      if (r.ok) {
+        const j = (await r.json()) as {
+          data?: {
+            all_oth?: Record<
+              string,
+              | number
+              | { accept?: number; noaction?: number; pending?: number; reject?: number }
+            >;
+          };
+        };
+        const allOth = j.data?.all_oth;
+        if (allOth) {
+          for (const [k, v] of Object.entries(allOth)) {
+            if (k === "ttl_cnt" || typeof v !== "object" || v === null) continue;
+            const a = v as {
+              accept?: number;
+              noaction?: number;
+              pending?: number;
+              reject?: number;
+            };
+            const t = (a.accept ?? 0) + (a.noaction ?? 0) + (a.pending ?? 0) + (a.reject ?? 0);
+            sectionCounts.set(k.toUpperCase(), t);
+          }
+        }
+      } else if (!firstError) {
+        firstError = `getCount HTTP ${r.status}`;
+      }
+    } catch (err) {
+      if (!firstError) firstError = `getCount: ${err instanceof Error ? err.message : String(err)}`;
+    }
+
+    // 2. Per-section invoice fetch. Skip empties.
+    for (const sec of SECTIONS) {
+      if (sectionCounts.size > 0 && (sectionCounts.get(sec) ?? 0) === 0) continue;
+      try {
+        const r = await fetch(
+          `/imsweb/auth/api/ims/getInvoices?gstin=${encodeURIComponent(gstin)}&section=${sec}`,
+          { credentials: "include", headers: { Accept: "application/json" } },
+        );
+        if (!r.ok) {
+          if (!firstError) firstError = `${sec} HTTP ${r.status}`;
+          continue;
+        }
+        const j = (await r.json()) as { data?: Record<string, unknown> };
+        const lower = ENV_KEY[sec] ?? sec.toLowerCase();
+        const invoices = j.data?.[lower];
+        if (Array.isArray(invoices) && invoices.length > 0) {
+          envelope[lower] = invoices;
+          rowCount += invoices.length;
+          fetchedSections++;
+        }
+      } catch (err) {
+        if (!firstError) firstError = `${sec}: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+
+    return { envelope, rowCount, fetchedSections, firstError };
+  })();
 }
 
 // ── Page-injected helpers (run inside the login tab, not the SW) ──
