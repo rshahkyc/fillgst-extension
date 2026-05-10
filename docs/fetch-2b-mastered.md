@@ -1,12 +1,12 @@
 # GSTR-2B without-OTP fetch — extension recovery guide
 
-> **2026-05-10 status:** This extension is the **fallback path** for GSTR-2B
-> fetch. The PRIMARY path is now `fillgst-helper-node` running Playwright
-> headless at `localhost:9876` (zero Chrome windows). The extension was
-> retired from the FillGST webapp picker. This doc is preserved so the
-> extension path can be revived if helper-node ever can't be used (locked-down
-> corporate IT, etc.). Frozen working state is git tag `v0.7.9` at commit
-> `fb80821`.
+> **2026-05-10 status:** Extension v0.8.0+ is a first-class path for
+> GSTR-2B (this doc) and now also GSTR-IMS (see
+> [`fetch-ims-mastered.md`](./fetch-ims-mastered.md)). For helper-node-
+> running power users, that path is preferred (zero Chrome windows);
+> for new users with just the Chrome extension installed, this path
+> works too. The webapp picker tries: helper-node → extension → GSP.
+> Frozen working state: git tag `v0.8.0` at commit `f237e7b`.
 
 If the without-OTP GSTR-2B fetch breaks AND the user can't use helper-node,
 this is the canonical recovery checkpoint for the extension path. Mastered
