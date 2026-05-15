@@ -43,6 +43,21 @@ export type ToExtension =
   | { type: "loginCheck"; gstin: string }
   | { type: "openLogin"; gstin: string }
   | { type: "fetch2b"; gstin: string; period: string }
+  // GSTR-1 portal fetch — runs from a return.gst.gov.in tab. Orchestrates
+  // 4 sub-fetches (formdetails / summary / totalsummarycount /
+  // invoice?inv=ALL per non-empty section) + optional geteinvdata for
+  // IRN + einvstatus. Returns a single `fetchGstr1Result` bundle the
+  // web app persists into Gstr1Snapshot + Gstr1PortalGet.
+  //
+  // Same shape as `Gstr1FetchBundle` produced by the helper-node path —
+  // the web app accepts both interchangeably.
+  | { type: "fetchGstr1"; gstin: string; period: string; skipEInvoice?: boolean }
+  // GSTR-3B portal fetch — runs from a return.gst.gov.in tab. Hits
+  // formdetails + summary + getr1r3bliab (the system-generated
+  // Section II/III breakdown). Optionally taxpayble (only meaningful
+  // post-save). Returns a single `fetchGstr3bResult` bundle matching
+  // `Gstr3bFetchBundle`.
+  | { type: "fetchGstr3b"; gstin: string; period: string; skipTaxPayable?: boolean }
   | {
       type: "dispatch";
       gstin: string;
@@ -114,6 +129,36 @@ export type FromExtension =
   | { ok: true; type: "loginStatus"; loggedIn: boolean; cookieCount: number }
   | { ok: true; type: "loginOpened"; tabId: number; message: string }
   | { ok: true; type: "fetch2bResult"; data: unknown; size: number }
+  // GSTR-1 bundle — same fields as helper-node's Gstr1FetchBundle so the
+  // web app accepts both paths identically.
+  | {
+      ok: true;
+      type: "fetchGstr1Result";
+      bundle: {
+        ok: boolean;
+        summary?: unknown;
+        counts?: unknown;
+        formDetails?: unknown;
+        sections: Record<string, unknown>;
+        einvoice?: unknown;
+        fetchedAt: string;
+        errors: Array<{ step: string; error: string }>;
+      };
+    }
+  // GSTR-3B bundle — same fields as helper-node's Gstr3bFetchBundle.
+  | {
+      ok: true;
+      type: "fetchGstr3bResult";
+      bundle: {
+        ok: boolean;
+        formDetails?: unknown;
+        summary?: unknown;
+        autoPopulated?: unknown;
+        taxPayable?: unknown;
+        fetchedAt: string;
+        errors: Array<{ step: string; error: string }>;
+      };
+    }
   // Result of loginAndFetchIms — `envelope` is a GETINV-shaped object
   // ready to POST to the web app's /api/ims/upload. `rowCount` is the
   // total invoices across the populated sections. `fetchedSections` is
@@ -155,7 +200,7 @@ export type FromExtension =
     };
 
 export const EXTENSION_NAME = "FillGST Helper";
-export const EXTENSION_VERSION = "0.8.0";
+export const EXTENSION_VERSION = "0.9.0";
 
 /**
  * Stable Chrome extension ID, deterministically derived from the public

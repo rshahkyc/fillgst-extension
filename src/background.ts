@@ -66,6 +66,12 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
     case "fetch2b":
       return fetch2bForPeriod(message.gstin, message.period);
 
+    case "fetchGstr1":
+      return fetchGstr1ForPeriod(message.gstin, message.period, message.skipEInvoice ?? false);
+
+    case "fetchGstr3b":
+      return fetchGstr3bForPeriod(message.gstin, message.period, message.skipTaxPayable ?? true);
+
     case "dispatch":
       return dispatchAction(message);
 
@@ -1784,6 +1790,364 @@ chrome.runtime.onMessage.addListener((rawMsg: unknown, _sender, sendResponse) =>
   // Tell Chrome we'll call sendResponse asynchronously.
   return true;
 });
+
+// ── GSTR-1 fetch ─────────────────────────────────────────────
+//
+// Orchestrates the same multi-call fetch the helper-node performs:
+//   1. formdetails           — filing status + ARN + sumGenStatus
+//   2. summary               — 46-section totals
+//   3. totalsummarycount     — per-section record counts
+//   4. invoice?inv=ALL per non-empty section — full invoice arrays
+//   5. geteinvdata           — IRN + einvstatus (low-volume; skip flag)
+//
+// Runs in a return.gst.gov.in tab via chrome.scripting.executeScript
+// so cookies + same-origin policy work naturally. Returns the same
+// bundle shape as helper-node's Gstr1FetchBundle.
+
+async function fetchGstr1ForPeriod(
+  gstin: string,
+  period: string,
+  skipEInvoice: boolean,
+): Promise<FromExtension> {
+  const status = await checkLoginStatus(gstin);
+  if (!status.ok || !("loggedIn" in status) || !status.loggedIn) {
+    return { ok: false, error: "Not logged in. Open the login tab first." };
+  }
+
+  // Need a tab on return.gst.gov.in so subsequent fetches are same-origin.
+  let tabId: number | undefined;
+  const tabs = await chrome.tabs.query({ url: "https://return.gst.gov.in/*" });
+  if (tabs.length > 0 && tabs[0]?.id) {
+    tabId = tabs[0].id;
+  } else {
+    const newTab = await chrome.tabs.create({
+      url: RETURNS_DASHBOARD_URL,
+      active: false,
+    });
+    if (!newTab.id) {
+      return { ok: false, error: "Could not open returns dashboard tab" };
+    }
+    tabId = newTab.id;
+    await waitForTabLoad(tabId, 20000);
+  }
+  if (!tabId) {
+    return { ok: false, error: "No tab available for GSTR-1 fetch" };
+  }
+
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: fetchGstr1InPage,
+      args: [period, skipEInvoice],
+    });
+    const out = result[0]?.result;
+    if (!out || typeof out !== "object") {
+      return { ok: false, error: "Content script returned no data" };
+    }
+    return {
+      ok: true,
+      type: "fetchGstr1Result",
+      bundle: out as {
+        ok: boolean;
+        summary?: unknown;
+        counts?: unknown;
+        formDetails?: unknown;
+        sections: Record<string, unknown>;
+        einvoice?: unknown;
+        fetchedAt: string;
+        errors: Array<{ step: string; error: string }>;
+      },
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+/** Injected into a return.gst.gov.in tab. Runs all 4-5 GSTR-1 calls
+ *  in sequence (faster than parallel — GSTN's WAF throttles aggressive
+ *  parallel requests). Returns a Gstr1FetchBundle-shaped object. */
+function fetchGstr1InPage(
+  period: string,
+  skipEInvoice: boolean,
+): Promise<{
+  ok: boolean;
+  summary?: unknown;
+  counts?: unknown;
+  formDetails?: unknown;
+  sections: Record<string, unknown>;
+  einvoice?: unknown;
+  fetchedAt: string;
+  errors: Array<{ step: string; error: string }>;
+}> {
+  return (async () => {
+    const RETURNS = "https://return.gst.gov.in";
+    const errors: Array<{ step: string; error: string }> = [];
+    const bundle: {
+      ok: boolean;
+      summary?: unknown;
+      counts?: unknown;
+      formDetails?: unknown;
+      sections: Record<string, unknown>;
+      einvoice?: unknown;
+      fetchedAt: string;
+      errors: Array<{ step: string; error: string }>;
+    } = {
+      ok: false,
+      sections: {},
+      fetchedAt: new Date().toISOString(),
+      errors,
+    };
+
+    const get = async (url: string, step: string): Promise<unknown | null> => {
+      try {
+        const r = await fetch(url, {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        });
+        if (!r.ok) {
+          errors.push({ step, error: `HTTP ${r.status}` });
+          return null;
+        }
+        return await r.json();
+      } catch (e) {
+        errors.push({ step, error: e instanceof Error ? e.message : String(e) });
+        return null;
+      }
+    };
+
+    // 1. formdetails
+    const fd = (await get(
+      `${RETURNS}/returns/auth/api/formdetails?rtn_prd=${period}&rtn_typ=GSTR1`,
+      "formdetails",
+    )) as { data?: unknown } | unknown;
+    if (fd) bundle.formDetails = (fd as { data?: unknown }).data ?? fd;
+
+    // 2. summary
+    const sm = (await get(
+      `${RETURNS}/returns/auth/api/gstr1/summary?rtn_prd=${period}`,
+      "summary",
+    )) as { data?: unknown } | unknown;
+    if (sm) bundle.summary = (sm as { data?: unknown }).data ?? sm;
+
+    // 3. totalsummarycount
+    const cn = (await get(
+      `${RETURNS}/returns/auth/api/gstr1/totalsummarycount?rtn_prd=${period}`,
+      "counts",
+    )) as { data?: { sec_count?: unknown }; sec_count?: unknown } | null;
+    if (cn) {
+      bundle.counts =
+        (cn as { data?: { sec_count?: unknown } }).data?.sec_count ??
+        (cn as { sec_count?: unknown }).sec_count ??
+        [];
+    }
+
+    // 4. per-section invoice fetches (only non-empty)
+    const sectionsWithData = new Set<string>();
+    const countsArr = bundle.counts as Array<{ sec_name: string; proc_cnt?: number }> | undefined;
+    if (countsArr) {
+      for (const c of countsArr) {
+        if ((c.proc_cnt ?? 0) > 0) sectionsWithData.add(c.sec_name);
+      }
+    }
+    const GSTR1_INVOICE_SECTIONS = [
+      "B2B",
+      "B2BA",
+      "CDNR",
+      "CDNRA",
+      "EXP",
+      "EXPA",
+      "B2CL",
+      "B2CLA",
+      "CDNUR",
+      "CDNURA",
+      "AT",
+      "ATA",
+      "TXPD",
+      "TXPDA",
+      "HSN",
+      "DOC",
+      "NIL",
+    ];
+    for (const sec of GSTR1_INVOICE_SECTIONS) {
+      // If we have counts and this section is empty, skip — saves ~12
+      // round-trips on a typical small business.
+      if (countsArr && !sectionsWithData.has(sec)) continue;
+      const url = `${RETURNS}/returns/auth/api/gstr1/invoice?inv=ALL&rtn_prd=${period}&sec_name=${sec}&uploaded_by=SU`;
+      const body = await get(url, `invoice/${sec}`);
+      if (body !== null) bundle.sections[sec] = body;
+    }
+
+    // 5. geteinvdata (e-Invoice IRN + einvstatus). Optional.
+    if (!skipEInvoice) {
+      const einv = await get(
+        `${RETURNS}/einvoice/auth/api/geteinvdata?rtn_prd=${period}`,
+        "geteinvdata",
+      );
+      if (einv !== null) bundle.einvoice = einv;
+    }
+
+    bundle.ok = !!(bundle.summary || bundle.formDetails);
+    return bundle;
+  })();
+}
+
+// ── GSTR-3B fetch ────────────────────────────────────────────
+//
+// Same shape as helper-node's Gstr3bFetchBundle:
+//   1. formdetails    — status + ARN + filing_dt
+//   2. summary        — flat sup_details / itc_elg shape (legacy)
+//   3. getr1r3bliab   — THE authoritative system-generated values
+//                       (nested sup_details.osup_3_1a.subtotal etc.,
+//                       elgitc.itc4a5.subtotal etc.)
+//   4. taxpayble      — optional, only meaningful post-save
+
+async function fetchGstr3bForPeriod(
+  gstin: string,
+  period: string,
+  skipTaxPayable: boolean,
+): Promise<FromExtension> {
+  const status = await checkLoginStatus(gstin);
+  if (!status.ok || !("loggedIn" in status) || !status.loggedIn) {
+    return { ok: false, error: "Not logged in. Open the login tab first." };
+  }
+
+  let tabId: number | undefined;
+  const tabs = await chrome.tabs.query({ url: "https://return.gst.gov.in/*" });
+  if (tabs.length > 0 && tabs[0]?.id) {
+    tabId = tabs[0].id;
+  } else {
+    const newTab = await chrome.tabs.create({
+      url: RETURNS_DASHBOARD_URL,
+      active: false,
+    });
+    if (!newTab.id) {
+      return { ok: false, error: "Could not open returns dashboard tab" };
+    }
+    tabId = newTab.id;
+    await waitForTabLoad(tabId, 20000);
+  }
+  if (!tabId) {
+    return { ok: false, error: "No tab available for GSTR-3B fetch" };
+  }
+
+  try {
+    const result = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: fetchGstr3bInPage,
+      args: [period, skipTaxPayable],
+    });
+    const out = result[0]?.result;
+    if (!out || typeof out !== "object") {
+      return { ok: false, error: "Content script returned no data" };
+    }
+    return {
+      ok: true,
+      type: "fetchGstr3bResult",
+      bundle: out as {
+        ok: boolean;
+        formDetails?: unknown;
+        summary?: unknown;
+        autoPopulated?: unknown;
+        taxPayable?: unknown;
+        fetchedAt: string;
+        errors: Array<{ step: string; error: string }>;
+      },
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function fetchGstr3bInPage(
+  period: string,
+  skipTaxPayable: boolean,
+): Promise<{
+  ok: boolean;
+  formDetails?: unknown;
+  summary?: unknown;
+  autoPopulated?: unknown;
+  taxPayable?: unknown;
+  fetchedAt: string;
+  errors: Array<{ step: string; error: string }>;
+}> {
+  return (async () => {
+    const RETURNS = "https://return.gst.gov.in";
+    const errors: Array<{ step: string; error: string }> = [];
+    const bundle: {
+      ok: boolean;
+      formDetails?: unknown;
+      summary?: unknown;
+      autoPopulated?: unknown;
+      taxPayable?: unknown;
+      fetchedAt: string;
+      errors: Array<{ step: string; error: string }>;
+    } = {
+      ok: false,
+      fetchedAt: new Date().toISOString(),
+      errors,
+    };
+
+    const get = async (url: string, step: string): Promise<unknown | null> => {
+      try {
+        const r = await fetch(url, {
+          credentials: "include",
+          headers: { Accept: "application/json" },
+        });
+        if (!r.ok) {
+          errors.push({ step, error: `HTTP ${r.status}` });
+          return null;
+        }
+        return await r.json();
+      } catch (e) {
+        errors.push({ step, error: e instanceof Error ? e.message : String(e) });
+        return null;
+      }
+    };
+
+    // 1. formdetails
+    const fd = (await get(
+      `${RETURNS}/returns/auth/api/formdetails?rtn_prd=${period}&rtn_typ=GSTR3B`,
+      "formdetails",
+    )) as { data?: unknown } | unknown;
+    if (fd) bundle.formDetails = (fd as { data?: unknown }).data ?? fd;
+
+    // 2. summary (legacy flat shape)
+    const sm = (await get(
+      `${RETURNS}/returns/auth/api/gstr3b/summary?rtn_prd=${period}`,
+      "summary",
+    )) as { data?: unknown } | unknown;
+    if (sm) bundle.summary = (sm as { data?: unknown }).data ?? sm;
+
+    // 3. getr1r3bliab — THE authoritative system-generated values
+    //    Note: param name is `retPeriod` (camel-case, no underscore) —
+    //    verified gotcha. The response nests data under r3bautopop.liabitc.
+    const ap = (await get(
+      `${RETURNS}/returns/auth/api/gstr3b/getr1r3bliab?retPeriod=${period}`,
+      "getr1r3bliab",
+    )) as { data?: { r3bautopop?: { liabitc?: unknown } } } | null;
+    if (ap) {
+      bundle.autoPopulated = ap?.data?.r3bautopop?.liabitc ?? null;
+    }
+
+    // 4. taxpayble (only meaningful post-save)
+    if (!skipTaxPayable) {
+      const tp = (await get(
+        `${RETURNS}/returns/auth/api/gstr3b/taxpayble?rtn_prd=${period}`,
+        "taxpayble",
+      )) as { data?: unknown } | unknown;
+      if (tp) bundle.taxPayable = (tp as { data?: unknown }).data ?? tp;
+    }
+
+    bundle.ok = !!(bundle.autoPopulated || bundle.summary || bundle.formDetails);
+    return bundle;
+  })();
+}
 
 // ── Lifecycle ───────────────────────────────────────────────
 
