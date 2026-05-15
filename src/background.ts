@@ -86,6 +86,9 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
     case "loginAndFetchIms":
       return loginAndFetchIms(message);
 
+    case "loginAndFetchGstr3b":
+      return loginAndFetchGstr3b(message);
+
     case "submitLoginCaptcha":
       return submitLoginCaptcha(message);
 
@@ -125,11 +128,15 @@ interface LoginSession {
   period: string;
   /**
    * Which fetch operation runs after login lands on /auth/dashboard.
-   * v0.8.0 added "ims"; "2b" is the original. Both share the same
-   * captcha + OTP flow; only the post-login fetch step differs.
+   * v0.8.0 added "ims"; v0.9.2 added "gstr3b"; "2b" is the original.
+   * All three share the same captcha + OTP flow; only the post-login
+   * fetch step differs.
    */
-  kind: "2b" | "ims";
+  kind: "2b" | "ims" | "gstr3b";
   step: "captcha" | "otp" | "fetch" | "done";
+  /** GSTR-3B-specific fetch options (only when kind === "gstr3b"). */
+  skipTaxPayable?: boolean;
+  includeLedgers?: boolean;
 }
 const loginSessions = new Map<string, LoginSession>();
 
@@ -291,6 +298,82 @@ async function loginAndFetchIms(
     period: msg.period,
     kind: "ims",
     step: "captcha",
+  });
+
+  return {
+    ok: true,
+    type: "needsCaptcha",
+    sessionId: msg.sessionId,
+    captchaImage: result.captchaImage,
+  };
+}
+
+/**
+ * v0.9.2 — Auto-login + GSTR-3B-fetch orchestrator.
+ *
+ * Identical login state machine as loginAndFetchIms (hidden minimised
+ * window → fill creds → captcha → optional OTP → dashboard). Only the
+ * post-login fetch step differs: instead of iterating IMS sections, we
+ * navigate the same tab to return.gst.gov.in and hit formdetails +
+ * summary + getr1r3bliab (plus optional taxpayble, getbalance,
+ * getopenliabilities when includeLedgers=true). The bundle that comes
+ * back matches helper-node's Gstr3bFetchBundle, so the web app can
+ * persist it via /api/portal/extension/persist-gstr3b-bundle.
+ */
+async function loginAndFetchGstr3b(
+  msg: Extract<ToExtension, { type: "loginAndFetchGstr3b" }>,
+): Promise<FromExtension> {
+  if (!msg.username || !msg.password) {
+    return { ok: true, type: "needsCredentials", sessionId: msg.sessionId };
+  }
+
+  const win = await chrome.windows.create({
+    url: LOGIN_URL,
+    type: "normal",
+    state: "minimized",
+    focused: false,
+  });
+  const tabId = win.tabs?.[0]?.id;
+  const windowId = win.id;
+  if (!tabId || windowId == null) {
+    return { ok: false, error: "Could not open login window" };
+  }
+  await waitForTabLoad(tabId, 25000);
+
+  // If cookies are still valid, login URL redirects to /auth/...; force
+  // a fresh captcha-driven login to re-establish a clean session.
+  const tabAfter = await chrome.tabs.get(tabId);
+  if (tabAfter.url && /\/auth\//.test(tabAfter.url)) {
+    await chrome.tabs.update(tabId, { url: LOGIN_URL });
+    await waitForTabLoad(tabId, 25000);
+  }
+
+  let result: { ok: boolean; captchaImage?: string; error?: string };
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: fillCredsAndCaptureCaptcha,
+      args: [msg.username, msg.password],
+    });
+    result = (r[0]?.result ?? { ok: false, error: "no result" }) as typeof result;
+  } catch (err) {
+    await chrome.windows.remove(windowId).catch(() => {});
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  if (!result.ok || !result.captchaImage) {
+    await chrome.windows.remove(windowId).catch(() => {});
+    return { ok: false, error: result.error ?? "Could not capture captcha" };
+  }
+
+  loginSessions.set(msg.sessionId, {
+    tabId,
+    windowId,
+    gstin: msg.gstin,
+    period: msg.period,
+    kind: "gstr3b",
+    step: "captcha",
+    skipTaxPayable: msg.skipTaxPayable ?? true,
+    includeLedgers: msg.includeLedgers ?? false,
   });
 
   return {
@@ -469,15 +552,26 @@ async function submitLoginOtp(
 
 /**
  * Dispatch to the right post-login fetch based on session.kind.
- * Both kinds use the same login state machine; only the fetch step
+ * All kinds share the same login state machine; only the fetch step
  * differs:
- *   - "2b"   → popup-window WAF dance against gstr2b.gst.gov.in
- *   - "ims"  → in-tab navigation to return.gst.gov.in then per-section
- *              same-origin fetch via /imsweb/auth/api/ims/...
+ *   - "2b"     → popup-window WAF dance against gstr2b.gst.gov.in
+ *   - "ims"    → in-tab navigation to return.gst.gov.in then per-section
+ *                same-origin fetch via /imsweb/auth/api/ims/...
+ *   - "gstr3b" → in-tab navigation to return.gst.gov.in then in-page
+ *                fetches against /returns/auth/api/gstr3b/... +
+ *                formdetails + optional getbalance/getopenliabilities
  */
 async function runPostLoginFetch(session: LoginSession): Promise<FromExtension> {
   if (session.kind === "ims") {
     return fetchImsViaTab(session.tabId, session.gstin, session.period);
+  }
+  if (session.kind === "gstr3b") {
+    return fetchGstr3bViaTab(
+      session.tabId,
+      session.period,
+      session.skipTaxPayable ?? true,
+      session.includeLedgers ?? false,
+    );
   }
   return popupAndFetch2b(session.tabId, session.period);
 }
@@ -825,6 +919,107 @@ async function fetchImsViaTab(
     rowCount: result.rowCount,
     fetchedSections: result.fetchedSections,
   };
+}
+
+/**
+ * v0.9.2 — GSTR-3B fetcher (in-tab variant, captcha-login path).
+ *
+ * Sibling of fetchImsViaTab: after the captcha-driven login lands on
+ * services.gst.gov.in/auth/dashboard, navigate the same tab to
+ * return.gst.gov.in/returns/auth/dashboard so subsequent fetches to
+ * /returns/auth/api/gstr3b/... and /returns/auth/api/formdetails are
+ * same-origin. Then reuse the existing in-page `fetchGstr3bInPage`
+ * helper to assemble the standard Gstr3bFetchBundle.
+ */
+async function fetchGstr3bViaTab(
+  tabId: number,
+  period: string,
+  skipTaxPayable: boolean,
+  includeLedgers: boolean,
+): Promise<FromExtension> {
+  const RETURNS_DASH = "https://return.gst.gov.in/returns/auth/dashboard";
+
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (u: string) => {
+        window.location.href = u;
+      },
+      args: [RETURNS_DASH],
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorCode: "GSTR3B_NAV_FAILED",
+    };
+  }
+  try {
+    await waitForTabLoad(tabId, 25000);
+  } catch {
+    return {
+      ok: false,
+      error: "return.gst.gov.in dashboard did not load within 25s",
+      errorCode: "GSTR3B_NAV_TIMEOUT",
+      retryable: true,
+    };
+  }
+  // Settle for cookies + SPA bootstrap.
+  await sleep(2000);
+
+  const finalTab = await chrome.tabs.get(tabId).catch(() => null);
+  const finalUrl = finalTab?.url ?? "";
+  if (finalUrl.includes("accessdenied") || finalUrl.includes("error/accessdenied")) {
+    return {
+      ok: false,
+      error: "GSTN bounced /returns/auth/dashboard to /accessdenied",
+      errorCode: "WAF_ACCESSDENIED",
+    };
+  }
+  if (!finalUrl.includes("return.gst.gov.in")) {
+    return {
+      ok: false,
+      error: `Expected to land on return.gst.gov.in, got: ${finalUrl}`,
+      errorCode: "GSTR3B_UNEXPECTED_URL",
+    };
+  }
+
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: fetchGstr3bInPage,
+      args: [period, skipTaxPayable, includeLedgers],
+    });
+    const out = r[0]?.result;
+    if (!out || typeof out !== "object") {
+      return {
+        ok: false,
+        error: "Content script returned no data",
+        errorCode: "GSTR3B_EMPTY",
+      };
+    }
+    return {
+      ok: true,
+      type: "fetchGstr3bResult",
+      bundle: out as {
+        ok: boolean;
+        formDetails?: unknown;
+        summary?: unknown;
+        autoPopulated?: unknown;
+        taxPayable?: unknown;
+        combinedBalance?: unknown;
+        openLiabilities?: unknown;
+        fetchedAt: string;
+        errors: Array<{ step: string; error: string }>;
+      },
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+      errorCode: "GSTR3B_FETCH_THREW",
+    };
+  }
 }
 
 /**
@@ -2017,26 +2212,73 @@ async function fetchGstr3bForPeriod(
 ): Promise<FromExtension> {
   const status = await checkLoginStatus(gstin);
   if (!status.ok || !("loggedIn" in status) || !status.loggedIn) {
-    return { ok: false, error: "Not logged in. Open the login tab first." };
+    return {
+      ok: false,
+      error: "Not logged in to GSTN portal. Click Login first (top of page), then re-click Fetch.",
+    };
   }
 
+  // Prefer an existing return.gst.gov.in tab. If none, open ONE as
+  // foreground (active:true) so the user sees if GSTN redirects them
+  // to the login screen — cookies-present-but-session-expired is the
+  // most common failure mode and creates the "Access Denied" pages
+  // the CA was seeing. With active:true they spot it immediately.
   let tabId: number | undefined;
+  let openedNewTab = false;
   const tabs = await chrome.tabs.query({ url: "https://return.gst.gov.in/*" });
   if (tabs.length > 0 && tabs[0]?.id) {
     tabId = tabs[0].id;
   } else {
     const newTab = await chrome.tabs.create({
       url: RETURNS_DASHBOARD_URL,
-      active: false,
+      active: true,
     });
     if (!newTab.id) {
       return { ok: false, error: "Could not open returns dashboard tab" };
     }
     tabId = newTab.id;
+    openedNewTab = true;
     await waitForTabLoad(tabId, 20000);
   }
   if (!tabId) {
     return { ok: false, error: "No tab available for GSTR-3B fetch" };
+  }
+
+  // Session validity check — cookies may be present but expired. Inject
+  // a tiny probe that returns the current URL + a sample auth-check
+  // header. If GSTN redirected us to a login / access-denied page,
+  // bail out with a friendly error instead of running all the API
+  // calls and getting 403s.
+  try {
+    const probe = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({
+        url: location.href,
+        title: document.title,
+        accessDenied:
+          /access\s*denied/i.test(document.body?.innerText ?? "") ||
+          /access\s*denied/i.test(document.title),
+      }),
+    });
+    const r = probe[0]?.result;
+    const onLogin =
+      r?.url?.includes("/services/login") ||
+      r?.url?.includes("/services/auth/fowelcome") ||
+      r?.url?.includes("/services/auth/login");
+    if (onLogin || r?.accessDenied) {
+      // Navigate the tab to the login URL so the user can sign in
+      // without manual URL typing.
+      if (openedNewTab) await chrome.tabs.update(tabId, { url: LOGIN_URL });
+      return {
+        ok: false,
+        error:
+          "GSTN session expired or not logged in. A login tab has been opened — please sign in, then re-click Fetch.",
+      };
+    }
+  } catch {
+    // Probe failed (script injection blocked or page navigation in
+    // flight). Fall through — the per-fetch error reporting will catch
+    // anything that's actually broken.
   }
 
   try {

@@ -112,6 +112,23 @@ export type ToExtension =
       username?: string;
       password?: string;
     }
+  // v0.9.2 — Auto-login + fetch-GSTR-3B in one flow. Identical login
+  // state machine as loginAndFetchIms (captcha → optional OTP →
+  // dashboard). Post-login, the same tab is navigated to
+  // return.gst.gov.in and we issue the standard 3B in-page fetches:
+  // formdetails + summary + getr1r3bliab (+ optional taxpayble,
+  // getbalance, getopenliabilities). Returns `fetchGstr3bResult`
+  // matching `Gstr3bFetchBundle`.
+  | {
+      type: "loginAndFetchGstr3b";
+      sessionId: string;
+      gstin: string;
+      period: string;
+      username?: string;
+      password?: string;
+      skipTaxPayable?: boolean;
+      includeLedgers?: boolean;
+    }
   | { type: "keepalive"; gstin: string }
   | { type: "logout"; gstin: string };
 
@@ -212,7 +229,7 @@ export type FromExtension =
     };
 
 export const EXTENSION_NAME = "FillGST Helper";
-export const EXTENSION_VERSION = "0.9.1";
+export const EXTENSION_VERSION = "0.9.2";
 
 /**
  * Stable Chrome extension ID, deterministically derived from the public
