@@ -70,7 +70,12 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
       return fetchGstr1ForPeriod(message.gstin, message.period, message.skipEInvoice ?? false);
 
     case "fetchGstr3b":
-      return fetchGstr3bForPeriod(message.gstin, message.period, message.skipTaxPayable ?? true);
+      return fetchGstr3bForPeriod(
+        message.gstin,
+        message.period,
+        message.skipTaxPayable ?? true,
+        message.includeLedgers ?? false,
+      );
 
     case "dispatch":
       return dispatchAction(message);
@@ -2008,6 +2013,7 @@ async function fetchGstr3bForPeriod(
   gstin: string,
   period: string,
   skipTaxPayable: boolean,
+  includeLedgers: boolean,
 ): Promise<FromExtension> {
   const status = await checkLoginStatus(gstin);
   if (!status.ok || !("loggedIn" in status) || !status.loggedIn) {
@@ -2037,7 +2043,7 @@ async function fetchGstr3bForPeriod(
     const result = await chrome.scripting.executeScript({
       target: { tabId },
       func: fetchGstr3bInPage,
-      args: [period, skipTaxPayable],
+      args: [period, skipTaxPayable, includeLedgers],
     });
     const out = result[0]?.result;
     if (!out || typeof out !== "object") {
@@ -2052,6 +2058,8 @@ async function fetchGstr3bForPeriod(
         summary?: unknown;
         autoPopulated?: unknown;
         taxPayable?: unknown;
+        combinedBalance?: unknown;
+        openLiabilities?: unknown;
         fetchedAt: string;
         errors: Array<{ step: string; error: string }>;
       },
@@ -2067,12 +2075,15 @@ async function fetchGstr3bForPeriod(
 function fetchGstr3bInPage(
   period: string,
   skipTaxPayable: boolean,
+  includeLedgers: boolean,
 ): Promise<{
   ok: boolean;
   formDetails?: unknown;
   summary?: unknown;
   autoPopulated?: unknown;
   taxPayable?: unknown;
+  combinedBalance?: unknown;
+  openLiabilities?: unknown;
   fetchedAt: string;
   errors: Array<{ step: string; error: string }>;
 }> {
@@ -2085,6 +2096,8 @@ function fetchGstr3bInPage(
       summary?: unknown;
       autoPopulated?: unknown;
       taxPayable?: unknown;
+      combinedBalance?: unknown;
+      openLiabilities?: unknown;
       fetchedAt: string;
       errors: Array<{ step: string; error: string }>;
     } = {
@@ -2142,6 +2155,33 @@ function fetchGstr3bInPage(
         "taxpayble",
       )) as { data?: unknown } | unknown;
       if (tp) bundle.taxPayable = (tp as { data?: unknown }).data ?? tp;
+    }
+
+    // 5. Ledgers (combined cash + ITC balance + open liabilities). One-
+    //    shot getbalance returns both ledgers in a single call from the
+    //    return.gst.gov.in session — no cross-domain hop needed.
+    if (includeLedgers) {
+      const bal = (await get(
+        `${RETURNS}/returns/auth/api/getbalance?ret_period=${period}`,
+        "getbalance",
+      )) as { data?: unknown } | unknown;
+      if (bal) bundle.combinedBalance = (bal as { data?: unknown }).data ?? bal;
+
+      // Open liabilities — surfaces error LG9029 "No Data Found" when
+      // empty; we treat that as { items: [], empty: true } downstream.
+      const liab = (await get(
+        `${RETURNS}/returns/auth/api/getopenliabilities`,
+        "getopenliabilities",
+      )) as { data?: { open_liab?: unknown[] }; errorCode?: string } | unknown;
+      if (liab) {
+        const liabObj = liab as { data?: { open_liab?: unknown[] }; errorCode?: string };
+        if (liabObj.errorCode === "LG9029") {
+          bundle.openLiabilities = { items: [], empty: true };
+        } else {
+          const items = liabObj.data?.open_liab ?? [];
+          bundle.openLiabilities = { items, empty: items.length === 0 };
+        }
+      }
     }
 
     bundle.ok = !!(bundle.autoPopulated || bundle.summary || bundle.formDetails);

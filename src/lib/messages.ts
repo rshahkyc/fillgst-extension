@@ -57,7 +57,15 @@ export type ToExtension =
   // Section II/III breakdown). Optionally taxpayble (only meaningful
   // post-save). Returns a single `fetchGstr3bResult` bundle matching
   // `Gstr3bFetchBundle`.
-  | { type: "fetchGstr3b"; gstin: string; period: string; skipTaxPayable?: boolean }
+  | {
+      type: "fetchGstr3b";
+      gstin: string;
+      period: string;
+      skipTaxPayable?: boolean;
+      /** Include cash + ITC balance + open liabilities. Enables the
+       *  "Fetch all system data for filing 3B" one-click workflow. */
+      includeLedgers?: boolean;
+    }
   | {
       type: "dispatch";
       gstin: string;
@@ -146,6 +154,8 @@ export type FromExtension =
       };
     }
   // GSTR-3B bundle — same fields as helper-node's Gstr3bFetchBundle.
+  // `combinedBalance` + `openLiabilities` are populated only when the
+  // request had `includeLedgers: true`.
   | {
       ok: true;
       type: "fetchGstr3bResult";
@@ -155,6 +165,8 @@ export type FromExtension =
         summary?: unknown;
         autoPopulated?: unknown;
         taxPayable?: unknown;
+        combinedBalance?: unknown;
+        openLiabilities?: unknown;
         fetchedAt: string;
         errors: Array<{ step: string; error: string }>;
       };
@@ -200,7 +212,7 @@ export type FromExtension =
     };
 
 export const EXTENSION_NAME = "FillGST Helper";
-export const EXTENSION_VERSION = "0.9.0";
+export const EXTENSION_VERSION = "0.9.1";
 
 /**
  * Stable Chrome extension ID, deterministically derived from the public
