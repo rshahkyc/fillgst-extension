@@ -42,6 +42,19 @@ export type ToExtension =
   | { type: "openExtensionsPage" }
   | { type: "loginCheck"; gstin: string }
   | { type: "openLogin"; gstin: string }
+  // Open the GST portal login tab AND pre-fill username + password
+  // (waits for the DOM, fills both fields, dispatches input/change/blur
+  // so Angular sees the values and the portal swaps in the captcha).
+  // Does NOT capture the captcha image — the user solves it directly
+  // in the portal tab. After login, the session cookies live in their
+  // own Chrome browser, so any subsequent gst.gov.in navigation in
+  // that browser is logged in.
+  //
+  // Used by FillGST's per-client "Login to GST portal" button: the web
+  // app POSTs to /api/portal/helper/credentials to decrypt the saved
+  // username/password, then sends them through this message. Cloud
+  // never persists them; they live in this single SW message round-trip.
+  | { type: "openLoginAutofilled"; gstin: string; username: string; password: string }
   | { type: "fetch2b"; gstin: string; period: string }
   // GSTR-1 portal fetch — runs from a return.gst.gov.in tab. Orchestrates
   // 4 sub-fetches (formdetails / summary / totalsummarycount /
@@ -153,6 +166,17 @@ export type FromExtension =
   | { ok: true; type: "extensionsPageOpened"; tabId: number }
   | { ok: true; type: "loginStatus"; loggedIn: boolean; cookieCount: number }
   | { ok: true; type: "loginOpened"; tabId: number; message: string }
+  // Sibling of `loginOpened` — same shape plus `prefilled: true` when
+  // the username + password were successfully injected into the form,
+  // false when the tab opened but fill failed (slow DOM, selector miss).
+  // Either way the tab is open; the web app shows a contextual hint.
+  | {
+      ok: true;
+      type: "loginAutofilled";
+      tabId: number;
+      prefilled: boolean;
+      message: string;
+    }
   | { ok: true; type: "fetch2bResult"; data: unknown; size: number }
   // GSTR-1 bundle — same fields as helper-node's Gstr1FetchBundle so the
   // web app accepts both paths identically.
@@ -229,7 +253,7 @@ export type FromExtension =
     };
 
 export const EXTENSION_NAME = "FillGST Helper";
-export const EXTENSION_VERSION = "0.9.2";
+export const EXTENSION_VERSION = "0.9.3";
 
 /**
  * Stable Chrome extension ID, deterministically derived from the public

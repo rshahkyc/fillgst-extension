@@ -63,6 +63,9 @@ async function handleMessage(message: ToExtension): Promise<FromExtension> {
     case "openLogin":
       return openLoginTab(message.gstin);
 
+    case "openLoginAutofilled":
+      return openLoginAutofilledTab(message.gstin, message.username, message.password);
+
     case "fetch2b":
       return fetch2bForPeriod(message.gstin, message.period);
 
@@ -1227,6 +1230,73 @@ async function fillCredsAndCaptureCaptcha(
   }
 }
 
+// Sibling of fillCredsAndCaptureCaptcha — fills the username + password
+// fields but does NOT capture the captcha image. Used by
+// openLoginAutofilledTab where the user will solve the captcha
+// themselves directly in the portal tab.
+//
+// Polls for the username input (up to 6 s) so the script can be invoked
+// before Angular has fully hydrated. Same Angular-friendly event
+// dispatch as fillCredsAndCaptureCaptcha (input + change + blur — the
+// portal listens on blur to render the captcha image).
+async function fillCredsNoCapture(
+  username: string,
+  password: string,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const wait = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+    // Poll for the username field. Login page hydrates within ~1-2 s
+    // but slow networks can stretch it to ~5 s.
+    let userField: HTMLInputElement | null = null;
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      const inputs = Array.from(document.querySelectorAll<HTMLInputElement>("input"));
+      userField =
+        inputs.find(
+          (i) => /user/i.test(i.id) || /user/i.test(i.name) || /user/i.test(i.placeholder),
+        ) ?? null;
+      if (userField) break;
+      await wait(200);
+    }
+    if (!userField) {
+      return { ok: false, error: "username field not found within 6s" };
+    }
+
+    userField.focus();
+    userField.value = username;
+    userField.dispatchEvent(new Event("input", { bubbles: true }));
+    userField.dispatchEvent(new Event("change", { bubbles: true }));
+    userField.dispatchEvent(new Event("blur", { bubbles: true }));
+
+    // GST portal has TWO password fields (one hidden decoy + the real
+    // visible one). Iterate by visibility; first visible wins.
+    const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>("input"));
+    let filledPassword = false;
+    for (const candidate of allInputs) {
+      if (candidate.type !== "password") continue;
+      const r = candidate.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+      const cs = window.getComputedStyle(candidate);
+      if (cs.display === "none" || cs.visibility === "hidden") continue;
+      candidate.focus();
+      candidate.value = password;
+      candidate.dispatchEvent(new Event("input", { bubbles: true }));
+      candidate.dispatchEvent(new Event("change", { bubbles: true }));
+      candidate.dispatchEvent(new Event("blur", { bubbles: true }));
+      filledPassword = true;
+      break;
+    }
+    if (!filledPassword) {
+      return { ok: false, error: "password field not found" };
+    }
+
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 /**
  * Page-injected fetch — runs in the gstr2b.gst.gov.in popup context.
  * Same-origin relative URL means cookies (including the WAF TS-cookie
@@ -1481,6 +1551,86 @@ async function openLoginTab(gstin: string): Promise<FromExtension> {
     type: "loginOpened",
     tabId: tab.id,
     message: "Login tab opened. Sign in with your credentials and captcha.",
+  };
+}
+
+// ── Open login tab + pre-fill credentials (no captcha capture) ──
+//
+// Sibling of `openLoginTab` — same tab-management semantics, but ALSO
+// injects a content script that types username + password into the
+// portal's login form. Does NOT capture the captcha image — the user
+// solves it in the real portal tab and clicks "Login" themselves.
+//
+// After login the GSTN session cookies live in the user's own Chrome
+// (vs the helper-node Playwright path where the cookies are in a
+// separate browser context), so all subsequent gst.gov.in navigation
+// in that Chrome window is logged in.
+
+async function openLoginAutofilledTab(
+  gstin: string,
+  username: string,
+  password: string,
+): Promise<FromExtension> {
+  // Re-use existing tab for this GSTIN if one is open.
+  let tabId: number | undefined;
+  const existingTabId = activeLoginTabs.get(gstin);
+  if (existingTabId) {
+    try {
+      const tab = await chrome.tabs.get(existingTabId);
+      if (tab && tab.url?.includes("gst.gov.in")) {
+        await chrome.tabs.update(tab.id!, { active: true });
+        tabId = tab.id;
+      }
+    } catch {
+      activeLoginTabs.delete(gstin);
+    }
+  }
+
+  if (!tabId) {
+    const tab = await chrome.tabs.create({ url: LOGIN_URL, active: true });
+    if (!tab.id) {
+      return { ok: false, error: "Could not create login tab" };
+    }
+    tabId = tab.id;
+    activeLoginTabs.set(gstin, tabId);
+    // Wait for the page to load before injecting. Login URL is fast (no
+    // SPA hydration delay), 15s is generous; we also poll for the
+    // username field inside the script.
+    try {
+      await waitForTabLoad(tabId, 15_000);
+    } catch {
+      // If the wait throws (timeout) we still try the injection — the
+      // username-field poll inside fillCredsNoCapture handles slow loads.
+    }
+  }
+
+  // Inject the credential-fill script. The script polls for the username
+  // input (up to 6 s) so we don't fail when the login page is still
+  // hydrating Angular.
+  let prefilled = false;
+  try {
+    const r = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: fillCredsNoCapture,
+      args: [username, password],
+    });
+    const result = (r[0]?.result ?? { ok: false }) as { ok: boolean; error?: string };
+    prefilled = result.ok;
+  } catch {
+    // Tab might have navigated away or extension-API quirk — fall through
+    // with prefilled=false. The tab is still open for the user to type
+    // creds manually.
+    prefilled = false;
+  }
+
+  return {
+    ok: true,
+    type: "loginAutofilled",
+    tabId,
+    prefilled,
+    message: prefilled
+      ? "Credentials filled. Solve the captcha and click Login."
+      : "Login tab opened. Couldn't auto-fill — please type your credentials manually.",
   };
 }
 
