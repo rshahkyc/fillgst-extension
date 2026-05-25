@@ -41,14 +41,22 @@ fillgst-extension/
 
 The difference between `manifest.json` and `manifest.webstore.json`:
 
-- `manifest.json` keeps `update_url`, `key`, and dev URLs (`localhost`,
-  `*.vercel.app`, `*.run.app`) — used by the self-hosted .crx flow we
-  already support at `https://fillgst.com/api/extension/updates.xml`.
+- `manifest.json` keeps `update_url`, `key`, and FillGST staging URLs
+  (`*.vercel.app`, `*.run.app`) — used by the self-hosted .crx flow
+  we already support at `https://fillgst.com/api/extension/updates.xml`.
 - `manifest.webstore.json` drops `update_url` (Web Store auto-updates),
-  drops `key` (Web Store assigns its own), and trims dev URLs from
-  `content_scripts.matches`, `externally_connectable.matches`, and
-  `host_permissions` — so the review team doesn't have to ask "why
-  does this extension run on localhost".
+  drops `key` (Web Store assigns its own), and trims FillGST staging
+  URLs from `content_scripts.matches` + `externally_connectable.matches`.
+
+**⚠ CRITICAL — DO NOT TRIM `http://localhost:9000/*` OR
+`http://localhost:9876/*` FROM `host_permissions`.** These are
+the user's own TallyPrime (port 9000) and FillGST Local Helper
+(port 9876) — the entire point of the extension. v0.9.3 shipped to
+the Web Store with localhost:9000 accidentally removed and broke
+Tally fetch for every user (fixed in v0.9.4). The localhost entries
+are NOT dev URLs — they are the runtime addresses of services on
+the user's own PC. Justification paragraphs are pre-written in
+section 4 below; paste them verbatim into the reviewer form.
 
 ---
 
@@ -185,7 +193,8 @@ in the corresponding box on the Web Store form:
 | `scripting` | Inject a small bridge into fillgst.com tabs (window.postMessage relay between the page and the extension's service worker). No external code execution. |
 | `tabs` | Find the user's existing GST portal tab (or open one) to run portal fetches inside their own session. |
 | `host_permissions: *.gst.gov.in` | The GST portal — where we fetch 2B / IMS / filing status using the user's already-authenticated session. |
-| `host_permissions: localhost:9876` | The FillGST helper service running on the user's own machine (handles TallyPrime / DSC signing locally). Optional — extension still works without it. |
+| `host_permissions: localhost:9000` | **TallyPrime's default HTTP server port** on the user's PC. When the user enables F1 → Settings → Connectivity → "TallyPrime acts as both server and client" (port 9000), Tally listens on this port for TDL XML queries. FillGST Helper sends voucher + ledger fetch requests directly to this port. **Books data never leaves the user's machine.** **CRITICAL: required for the core "pull from Tally Live" feature — DO NOT remove from `manifest.webstore.json` (v0.9.3 shipped without it and broke Tally fetch for every Web Store user; fixed in v0.9.4).** |
+| `host_permissions: localhost:9876` | The optional FillGST Local Helper Node.js process running on the user's own machine. Handles DSC USB-token signing (PKCS#11) and the Playwright-driven GSTN portal flow. Optional — extension still works for Tally fetch without it via port 9000 directly. |
 | `externally_connectable: fillgst.com` | Allows fillgst.com pages to send `chrome.runtime.sendMessage` to the extension (the user-initiated "Fetch 2B" trigger). |
 
 ### Privacy policy URL

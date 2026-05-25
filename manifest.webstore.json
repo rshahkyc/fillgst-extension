@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FillGST Helper",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "Connects FillGST to the GST portal + your local TallyPrime — no OTP after first login, books data never leaves your PC.",
   "minimum_chrome_version": "111",
   "icons": {
@@ -81,6 +81,8 @@
   "permissions": ["cookies", "storage", "scripting", "tabs"],
   "host_permissions": [
     "https://*.gst.gov.in/*",
+    "http://localhost:9000/*",
+    "http://127.0.0.1:9000/*",
     "http://localhost:9876/*",
     "http://127.0.0.1:9876/*"
   ],
